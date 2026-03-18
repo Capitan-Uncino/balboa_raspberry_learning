@@ -5,35 +5,57 @@ use rand::rng;
 use rand_distr::{Distribution, Normal, Uniform};
 use std::error::Error;
 
-// --- Constants ---
-const DIM_X: usize = 3;
-const DIM_U: usize = 3;
+// --- System Dimensions ---
+const DIM_X: usize = 2; // [theta, theta_dot]
+const DIM_U: usize = 1; // [torque]
 const DIM_X_AND_U: usize = DIM_X + DIM_U;
 const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 
-// Paper settings (exact)
-const GAMMA: f64 = 0.98;
-const SAMPLES_PER_ITER: usize = 50000;
+// --- LSPI Hyperparameters ---
+const GAMMA: f64 = 0.99; // Discount factor
+const SAMPLES_PER_ITER: usize = 10000; // Samples per policy evaluation
 const MAX_ITERATIONS: usize = 15;
-const LAMBDA_REG: f64 = 1e-6;
+const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
+const DT: f64 = 0.05; // Time step for discretization
+
+// --- Physics Constants (Pendulum) ---
+const G: f64 = 9.81;
+const L: f64 = 1.0;
+const M: f64 = 1.0;
 
 // --- System Definition ---
-struct LQRSystem {
+struct PendulumSystem {
     A: SMatrix<f64, DIM_X, DIM_X>,
     B: SMatrix<f64, DIM_X, DIM_U>,
     Q: SMatrix<f64, DIM_X, DIM_X>,
     R: SMatrix<f64, DIM_U, DIM_U>,
+    resettable: bool,
 }
 
-impl LQRSystem {
-    fn new_paper_instance() -> Self {
-        // A from Eq 5.1 in paper (Spectral radius ~1.02)
-        let A = SMatrix::<f64, 3, 3>::new(1.01, 0.01, 0.00, 0.01, 1.01, 0.01, 0.00, 0.01, 1.01);
-        let B = SMatrix::<f64, 3, 3>::identity();
-        let Q = SMatrix::<f64, 3, 3>::identity() * 1e-3;
-        let R = SMatrix::<f64, 3, 3>::identity();
+impl PendulumSystem {
+    fn new(resettable: bool) -> Self {
+        // Continuous Time Dynamics (Linearized at theta=0)
+        // x_dot = [0, 1; g/l, 0] * x + [0; 1/(ml^2)] * u
+        // Discretized: x_{k+1} = (I + A*dt) * x_k + (B*dt) * u_k
 
-        Self { A, B, Q, R }
+        let a_cont = SMatrix::<f64, 2, 2>::new(0.0, 1.0, G / L, 0.0);
+        let b_cont = SMatrix::<f64, 2, 1>::new(0.0, 1.0 / (M * L * L));
+
+        // Simple Euler Discretization
+        let A = SMatrix::<f64, 2, 2>::identity() + a_cont * DT;
+        let B = b_cont * DT;
+
+        // LQR Costs
+        let Q = SMatrix::<f64, 2, 2>::from_diagonal(&SVector::from([1.0, 0.1])); // Penalty on angle
+        let R = SMatrix::<f64, 1, 1>::from_diagonal(&SVector::from([0.1])); // Penalty on torque
+
+        Self {
+            A,
+            B,
+            Q,
+            R,
+            resettable,
+        }
     }
 
     fn step(&self, x: &SVector<f64, DIM_X>, u: &SVector<f64, DIM_U>) -> SVector<f64, DIM_X> {
@@ -49,7 +71,6 @@ struct Simulation {
     diag_iterations: Vec<usize>,
     diag_policy_error: Vec<f64>,
     diag_spectral_radius: Vec<f64>,
-    diag_theta_norm: Vec<f64>,
 }
 
 impl Simulation {
@@ -61,93 +82,94 @@ impl Simulation {
             diag_iterations: Vec::new(),
             diag_policy_error: Vec::new(),
             diag_spectral_radius: Vec::new(),
-            diag_theta_norm: Vec::new(),
         }
     }
 }
 
 // --- Main Algorithm ---
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("=== LSPI Multi-Start Experiment ===");
-    let system = LQRSystem::new_paper_instance();
+    println!("=== LSPI Inverted Pendulum Experiment ===");
+    let system = PendulumSystem::new(false);
 
-    // 1. Compute Analytic Ground Truth
+    //Compute Analytic Ground Truth (LQR)
     let K_star = solve_dare_analytic(&system);
     let rho_star = spectral_radius(&system.A, &system.B, &K_star);
+    println!("Optimal K: {:.4}", K_star);
     println!("Optimal Spectral Radius: {:.4}", rho_star);
 
-    // 2. Initialize 10 Simulations
+    // Initialize Simulations
     let mut sims = Vec::new();
     let mut rng = rng();
 
-    // --> 5 STABLE Identifications (K ~ 0.2 * I + noise)
-    // A ~ 1.01. K=0.2 makes A-BK ~ 0.8. Stable.
+    // STABLE Starts (PD Controller: K ~ [10, 3])
+    // A rough PD controller stabilizes the pendulum
     for i in 0..5 {
-        // FIX 1: Added .unwrap() because Uniform::new returns a Result now
-        let noise_dist = Uniform::new(-0.1, 0.1).unwrap();
-        let noise = SMatrix::<f64, DIM_U, DIM_X>::from_fn(|_, _| noise_dist.sample(&mut rng));
-        let K_init = (SMatrix::<f64, DIM_U, DIM_X>::identity() * 0.2) + noise;
-        sims.push(Simulation::new(i, format!("Stable {}", i + 1), K_init));
+        let noise_dist = Uniform::new(-5.0, 5.0).unwrap();
+        let noise_vec = SMatrix::<f64, DIM_U, DIM_X>::from_fn(|_, _| noise_dist.sample(&mut rng));
+
+        // Base Stable Controller (PD): K = [15.0, 5.0]
+        let K_stable = SMatrix::<f64, 1, 2>::new(15.0, 5.0) + noise_vec;
+        sims.push(Simulation::new(i, format!("Stable PD {}", i + 1), K_stable));
     }
 
-    // --> 5 UNSTABLE Identifications (K ~ 0.0 + noise)
-    // A ~ 1.01. K=0.0 makes A-BK ~ 1.01. Unstable.
-    for i in 5..10 {
-        // FIX 1: Added .unwrap()
-        let noise_dist = Uniform::new(-0.1, 0.1).unwrap();
-        let K_init = SMatrix::<f64, DIM_U, DIM_X>::zeros()
-            + SMatrix::from_fn(|_, _| noise_dist.sample(&mut rng));
-        sims.push(Simulation::new(i, format!("Unstable {}", i - 4), K_init));
+    //  UNSTABLE Starts (Zero or Random small gains)
+    for i in 5..20 {
+        let noise_dist = Uniform::new(-20.0, 20.0).unwrap();
+        let K_unstable = SMatrix::<f64, DIM_U, DIM_X>::from_fn(|_, _| noise_dist.sample(&mut rng));
+        sims.push(Simulation::new(
+            i,
+            format!("Unstable Rand {}", i - 4),
+            K_unstable,
+        ));
     }
 
-    // 3. Run Loop
-    let exploration_dist = Normal::new(0.0, 1.0).unwrap();
+    //  Run LSPI Loop
+    // Exploration noise needs to be significant to excite the dynamics
+    let exploration_dist = Normal::new(0.0, 5.0).unwrap();
 
     for iter in 0..MAX_ITERATIONS {
         println!("--- Iteration {}/{} ---", iter + 1, MAX_ITERATIONS);
 
-        // Update every simulation
         for sim in &mut sims {
             // A. Run LSTDQ
-            let (theta, _cond) = run_lstdq(&system, &sim.K, &exploration_dist, &mut rng);
+            let (theta, _) = run_lstdq(&system, &sim.K, &exploration_dist, &mut rng);
 
             // B. Update Policy
             let H = theta_to_H(&theta);
             let K_new = compute_K_from_H(&H);
 
-            // C. Record Diagnostics
+            // C. Diagnostics
             let error = (K_new - K_star).norm();
             let rho = spectral_radius(&system.A, &system.B, &K_new);
-            let theta_n = theta.norm();
 
             sim.diag_iterations.push(iter);
             sim.diag_policy_error.push(error);
             sim.diag_spectral_radius.push(rho);
-            sim.diag_theta_norm.push(theta_n);
-
             sim.K = K_new;
         }
     }
 
-    // 4. Plot All
-    println!("-> Generating Combined Plots...");
+    // 4. Plot Results
+    println!("-> Generating Plots...");
     plot_combined_results(&sims)?;
     println!("-> Done.");
 
     Ok(())
 }
 
-// --- Plotting Logic (Greens vs Reds) ---
+// --- Plotting Logic ---
+// --- Plotting Logic (Both Graphs) ---
 fn plot_combined_results(sims: &Vec<Simulation>) -> Result<(), Box<dyn Error>> {
     let x_max = MAX_ITERATIONS as f64;
 
     // 1. Policy Error Plot (Clamped)
     {
-        let root = BitMapBackend::new("01_multi_policy_error.png", (1024, 768)).into_drawing_area();
+        let root =
+            BitMapBackend::new("01_pendulum_policy_error.png", (1024, 768)).into_drawing_area();
         root.fill(&WHITE)?;
 
-        // Cap the error view at 2.0 so huge errors don't squash the chart
-        let max_err = 2.0;
+        // Cap the error view at 10.0 because unstable gains might be huge
+        let max_err = 10.0;
 
         let mut chart = ChartBuilder::on(&root)
             .caption(
@@ -159,19 +181,19 @@ fn plot_combined_results(sims: &Vec<Simulation>) -> Result<(), Box<dyn Error>> {
             .y_label_area_size(40)
             .build_cartesian_2d(0f64..x_max, 0f64..max_err)?;
 
-        chart.configure_mesh().draw()?;
+        chart
+            .configure_mesh()
+            .y_desc("Error ||K - K*||")
+            .x_desc("Iterations")
+            .draw()?;
 
         for (i, sim) in sims.iter().enumerate() {
-            // COLOR LOGIC:
-            // - Stable (0-4): Green gradients
-            // - Unstable (5-9): Red gradients
+            // COLOR LOGIC: Green for Stable (0-4), Red for Unstable (5-9)
             let color = if i < 5 {
-                // Variation of Green: RGB(0, 100..255, 0)
                 let intensity = 100 + (i as u8 * 30);
                 RGBColor(0, intensity, 0).mix(0.8)
             } else {
-                // Variation of Red: RGB(100..255, 0, 0)
-                let intensity = 100 + ((i - 5) as u8 * 30);
+                let intensity = 100 + ((i - 5) as u8 * 10);
                 RGBColor(intensity, 0, 0).mix(0.8)
             };
 
@@ -197,7 +219,7 @@ fn plot_combined_results(sims: &Vec<Simulation>) -> Result<(), Box<dyn Error>> {
     // 2. Spectral Radius Plot (ZOOMED IN)
     {
         let root =
-            BitMapBackend::new("02_multi_spectral_radius.png", (1024, 768)).into_drawing_area();
+            BitMapBackend::new("02_pendulum_spectral_radius.png", (1024, 768)).into_drawing_area();
         root.fill(&WHITE)?;
 
         // Zoomed in Y-axis
@@ -231,7 +253,7 @@ fn plot_combined_results(sims: &Vec<Simulation>) -> Result<(), Box<dyn Error>> {
                 let intensity = 100 + (i as u8 * 30);
                 RGBColor(0, intensity, 0).mix(0.8)
             } else {
-                let intensity = 100 + ((i - 5) as u8 * 30);
+                let intensity = 100 + ((i - 5) as u8 * 10);
                 RGBColor(intensity, 0, 0).mix(0.8)
             };
 
@@ -255,52 +277,85 @@ fn plot_combined_results(sims: &Vec<Simulation>) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
-} // --- LSTDQ Implementation ---
+}
+// --- Constants Update ---
+const ETA: f64 = 0.1; // Parameter eta from Algorithm 2 (Tune this!)
+
+// --- Updated LSTDQ Implementation (Algorithm 2) ---
 fn run_lstdq(
-    sys: &LQRSystem,
+    sys: &PendulumSystem,
     K: &SMatrix<f64, DIM_U, DIM_X>,
     dist: &impl Distribution<f64>,
     rng: &mut ThreadRng,
 ) -> (SVector<f64, DIM_PARAMS>, f64) {
     let mut A_mat = DMatrix::<f64>::zeros(DIM_PARAMS, DIM_PARAMS);
     let mut b_vec = DVector::<f64>::zeros(DIM_PARAMS);
-    let mut x = SVector::<f64, DIM_X>::from_fn(|_, _| dist.sample(rng));
+
+    // Construct matrix M = [I; K]
+    let mut M_mat = SMatrix::<f64, DIM_X_AND_U, DIM_X>::zeros();
+
+    // Top block is Identity (Dimension X)
+    M_mat
+        .fixed_view_mut::<DIM_X, DIM_X>(0, 0)
+        .copy_from(&SMatrix::<f64, DIM_X, DIM_X>::identity());
+
+    // Bottom block is K (Dimension U x X)
+    M_mat.fixed_view_mut::<DIM_U, DIM_X>(DIM_X, 0).copy_from(K);
+
+    // Compute the outer product: P = M * M^T
+    let P = M_mat * M_mat.transpose();
+
+    // Vectorize P to get the bias vector: bias = eta * svec(P)
+    let mut bias_vec = SVector::<f64, DIM_PARAMS>::zeros();
+    let mut idx = 0;
+    // Note: We must use the same svec ordering as get_quadratic_features
+    for i in 0..DIM_X_AND_U {
+        for j in i..DIM_X_AND_U {
+            let val = P[(i, j)];
+            bias_vec[idx] = val * ETA;
+            idx += 1;
+        }
+    }
+
+    let mut x = SVector::<f64, DIM_X>::from_fn(|_, _| dist.sample(rng) * 0.1);
 
     for _ in 0..SAMPLES_PER_ITER {
         let noise = SVector::<f64, DIM_U>::from_fn(|_, _| dist.sample(rng));
-        let u = (-K * x) + noise;
-        let cost = x.dot(&(sys.Q * x)) + u.dot(&(sys.R * u)); // Discounted Cost
+        let u = (-K * x) + noise; // Exploration Policy
+
+        // Cost calculation
+        let cost = x.dot(&(sys.Q * x)) + u.dot(&(sys.R * u));
+
         let x_next = sys.step(&x, &u);
 
-        let phi = get_quadratic_features(&x, &u);
-        let u_next_greedy = -K * x_next;
-        let phi_next = get_quadratic_features(&x_next, &u_next_greedy);
+        // Feature computation with BIAS
+        // phi(x,u) = svec([x;u][x;u]^T) + bias_vec
+        let phi = get_quadratic_features(&x, &u) + bias_vec;
 
+        let u_next_greedy = -K * x_next;
+        let phi_next = get_quadratic_features(&x_next, &u_next_greedy) + bias_vec;
+
+        // LSTDQ Update
         let temporal_diff = &phi - (GAMMA * &phi_next);
 
-        // Manual outer product
         for r in 0..DIM_PARAMS {
             let phi_r = phi[r];
-            let cost_term = phi_r * cost;
-            b_vec[r] += cost_term;
+            b_vec[r] += phi_r * cost;
             for c in 0..DIM_PARAMS {
                 A_mat[(r, c)] += phi_r * temporal_diff[c];
             }
         }
 
         x = x_next;
-        // Reset if unstable to keep data valid
-        if x.norm() > 50.0 {
-            x = SVector::<f64, DIM_X>::from_fn(|_, _| dist.sample(rng));
+        if sys.resettable && x.norm() > 2.0 {
+            // Pendulum reset
+            x = SVector::<f64, DIM_X>::from_fn(|_, _| dist.sample(rng) * 0.1);
         }
     }
 
     for i in 0..DIM_PARAMS {
         A_mat[(i, i)] += LAMBDA_REG;
     }
-
-    let svd = A_mat.clone().svd(false, false);
-    let cond = svd.singular_values[0] / svd.singular_values[svd.singular_values.len() - 1];
 
     let theta_dyn = A_mat
         .lu()
@@ -309,9 +364,8 @@ fn run_lstdq(
     let mut theta = SVector::<f64, DIM_PARAMS>::zeros();
     theta.copy_from_slice(theta_dyn.as_slice());
 
-    (theta, cond)
+    (theta, 0.0)
 }
-
 // --- Helpers ---
 fn get_quadratic_features(
     x: &SVector<f64, DIM_X>,
@@ -321,7 +375,6 @@ fn get_quadratic_features(
     let mut z = SVector::<f64, DIM_X_AND_U>::zeros();
     z.fixed_view_mut::<DIM_X, 1>(0, 0).copy_from(x);
     z.fixed_view_mut::<DIM_U, 1>(DIM_X, 0).copy_from(u);
-
     let mut idx = 0;
     for i in 0..DIM_X_AND_U {
         for j in i..DIM_X_AND_U {
@@ -366,10 +419,12 @@ fn spectral_radius(
 ) -> f64 {
     let A_cl = A - B * K;
     let eig = A_cl.complex_eigenvalues();
-    eig.iter().map(|c| c.norm()).fold(0.0, f64::max)
+    eig.iter()
+        .map(|c| c.norm())
+        .fold(0.0, |a, b| f64::max(a, b))
 }
 
-fn solve_dare_analytic(sys: &LQRSystem) -> SMatrix<f64, DIM_U, DIM_X> {
+fn solve_dare_analytic(sys: &PendulumSystem) -> SMatrix<f64, DIM_U, DIM_X> {
     let mut P = sys.Q.clone();
     for _ in 0..5000 {
         let term1 = sys.R + GAMMA * sys.B.transpose() * P * sys.B;
