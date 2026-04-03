@@ -1,6 +1,9 @@
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 
-use rppal::i2c::I2c;
+use serialport::SerialPort;
+use std::convert::TryInto;
+use std::io::{Read, Write};
+
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -195,49 +198,60 @@ fn calculate_k(
 }
 
 /// Helper function to pack 4 floats and write them to I2C offset 20
-fn write_gains(i2c_bus: &Arc<Mutex<I2c>>, gains: [f32; 4]) {
+fn write_gains(serial_bus: &Arc<Mutex<Box<dyn SerialPort>>>, gains: [f32; 4]) {
     let mut write_buf = Vec::with_capacity(16);
 
     for k in gains {
         write_buf.extend_from_slice(&k.to_le_bytes());
     }
 
-    if let Ok(mut bus) = i2c_bus.lock() {
-        // CRITICAL UPDATE: Write to offset 20, because 0-19 is taken by the 5 read floats
-        if let Err(e) = bus.block_write(20, &write_buf) {
-            eprintln!("I2C Write Error: {:?}", e);
+    if let Ok(mut port) = serial_bus.lock() {
+        // UART is a stream, so there are no register "offsets".
+        // We just blast the 16 bytes directly down the wire.
+        if let Err(e) = port.write_all(&write_buf) {
+            eprintln!("UART Write Error: {:?}", e);
         }
     } else {
-        eprintln!("Failed to acquire I2C lock for writing.");
+        eprintln!("Failed to acquire UART lock for writing.");
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize the I2C bus and set the slave address
-    let mut i2c = I2c::with_bus(1)?;
-    i2c.set_slave_address(BALBOA_ADDR)?;
+    // 1. Initialize the UART bus (Serial port)
+    // Note: Use "/dev/ttyS0" or "/dev/ttyAMA0" depending on your Pi's UART configuration
+    let port_name = "/dev/ttyS0";
+    let baud_rate = 115200;
 
-    let i2c_bus = Arc::new(Mutex::new(i2c));
+    let port = serialport::new(port_name, baud_rate)
+        // Set a 10ms timeout so read_exact doesn't block forever if the Arduino unplugs
+        .timeout(Duration::from_millis(10))
+        .open()?;
+
+    let serial_bus = Arc::new(Mutex::new(port));
 
     let initial_k_mat = SMatrix::<f64, 1, 4>::from_row_slice(&[100.0, 5.0, 2.0, 0.5]);
     let current_k = Arc::new(Mutex::new(initial_k_mat));
 
-    write_gains(&i2c_bus, [100.0f32, 5.0, 2.0, 0.5]);
+    // Send the initial gains to the Arduino
+    write_gains(&serial_bus, [100.0f32, 5.0, 2.0, 0.5]);
 
     let mut state_batch: Vec<StateAction> = Vec::with_capacity(SAMPLES_PER_ITER);
 
-    println!("Starting 100Hz control loop...");
+    println!("Starting 100Hz control loop on {}...", port_name);
 
     loop {
         let start_time = Instant::now();
 
         let mut buf = [0u8; 20];
+
+        // 2. Read exactly 20 bytes from the serial stream
         let read_result = {
-            let mut bus = i2c_bus.lock().unwrap();
-            bus.block_read(0, &mut buf)
+            let mut bus = serial_bus.lock().unwrap();
+            bus.read_exact(&mut buf)
         };
 
         if read_result.is_ok() {
+            // The Arduino ATmega32u4 is Little-Endian, which matches from_le_bytes perfectly
             let data = StateAction {
                 phi: f32::from_le_bytes(buf[0..4].try_into().unwrap()),
                 phi_dot: f32::from_le_bytes(buf[4..8].try_into().unwrap()),
@@ -248,7 +262,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             state_batch.push(data);
         } else {
-            eprintln!("I2C Read Error");
+            // Note: If the Arduino falls behind, you will see timeout errors here.
+            // This is safer than freezing the whole thread!
+            // eprintln!("UART Read Error/Timeout");
         }
 
         // 3. Check if the batch is full
@@ -258,13 +274,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::mem::replace(&mut state_batch, Vec::with_capacity(SAMPLES_PER_ITER));
 
             // Clone the Arcs for the background thread
-            let i2c_clone = Arc::clone(&i2c_bus);
+            let serial_clone = Arc::clone(&serial_bus);
             let k_clone = Arc::clone(&current_k);
 
             // Spawn a detached thread to handle the math and writing
             thread::spawn(move || {
-                // a. Safely read the current K matrix
-                // We copy it into a local variable so we don't hold the lock during heavy math
                 let k_to_use = { *k_clone.lock().unwrap() };
 
                 let new_k_mat = calculate_k(batch_to_process, &k_to_use);
@@ -273,7 +287,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *k_clone.lock().unwrap() = new_k_mat;
                 }
 
-                // d. Convert the new SMatrix down to an f32 array for the Arduino
                 let new_k_array = [
                     new_k_mat[(0, 0)] as f32,
                     new_k_mat[(0, 1)] as f32,
@@ -281,8 +294,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     new_k_mat[(0, 3)] as f32,
                 ];
 
-                // e. Push to Arduino
-                write_gains(&i2c_clone, new_k_array);
+                // e. Push to Arduino via UART
+                write_gains(&serial_clone, new_k_array);
                 println!("Pushed new K vector to Arduino.");
             });
         }
