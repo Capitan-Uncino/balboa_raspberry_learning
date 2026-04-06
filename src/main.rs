@@ -29,7 +29,7 @@ const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 const GAMMA: f64 = 0.99; // Discount factor
 const SAMPLES_PER_ITER: usize = 10000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
-const ETA: f64 = 0.1; // Parameter eta from Algorithm 2 (Tune this!)
+const ETA: f64 = 1.068;
 
 fn get_quadratic_features(
     x: &SVector<f64, DIM_X>,
