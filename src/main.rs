@@ -197,19 +197,26 @@ fn calculate_k(
     compute_k_from_h(&h_mat)
 }
 
-/// Helper function to pack 4 floats and write them to I2C offset 20
 fn write_gains(serial_bus: &Arc<Mutex<Box<dyn SerialPort>>>, gains: [f32; 4]) {
     let mut write_buf = Vec::with_capacity(16);
 
+    // Pack the 4 floats into little-endian bytes
     for k in gains {
         write_buf.extend_from_slice(&k.to_le_bytes());
     }
 
     if let Ok(mut port) = serial_bus.lock() {
-        // UART is a stream, so there are no register "offsets".
-        // We just blast the 16 bytes directly down the wire.
+        // Console feedback so you know exactly what LSTDQ is deciding
+        println!(
+            "---> Sending Gains: [k1: {:.3}, k2: {:.3}, k3: {:.3}, k4: {:.3}]",
+            gains[0], gains[1], gains[2], gains[3]
+        );
+
         if let Err(e) = port.write_all(&write_buf) {
             eprintln!("UART Write Error: {:?}", e);
+        } else {
+            // Force the OS to push the bytes out the TX pin right now
+            let _ = port.flush();
         }
     } else {
         eprintln!("Failed to acquire UART lock for writing.");
@@ -217,13 +224,14 @@ fn write_gains(serial_bus: &Arc<Mutex<Box<dyn SerialPort>>>, gains: [f32; 4]) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize the UART bus (Serial port)
-    // Note: Use "/dev/ttyS0" or "/dev/ttyAMA0" depending on your Pi's UART configuration
+    println!("========================================");
+    println!("    BALBOA BRAIN v2.0 - UART ENABLED    ");
+    println!("========================================");
+
     let port_name = "/dev/ttyS0";
     let baud_rate = 115200;
 
     let port = serialport::new(port_name, baud_rate)
-        // Set a 10ms timeout so read_exact doesn't block forever if the Arduino unplugs
         .timeout(Duration::from_millis(10))
         .open()?;
 
@@ -232,26 +240,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_k_mat = SMatrix::<f64, 1, 4>::from_row_slice(&[100.0, 5.0, 2.0, 0.5]);
     let current_k = Arc::new(Mutex::new(initial_k_mat));
 
-    // Send the initial gains to the Arduino
     write_gains(&serial_bus, [100.0f32, 5.0, 2.0, 0.5]);
 
     let mut state_batch: Vec<StateAction> = Vec::with_capacity(SAMPLES_PER_ITER);
+
+    // --- Counter for throttled feedback ---
+    let mut loop_counter = 0;
 
     println!("Starting 100Hz control loop on {}...", port_name);
 
     loop {
         let start_time = Instant::now();
-
         let mut buf = [0u8; 20];
 
-        // 2. Read exactly 20 bytes from the serial stream
         let read_result = {
             let mut bus = serial_bus.lock().unwrap();
             bus.read_exact(&mut buf)
         };
 
         if read_result.is_ok() {
-            // The Arduino ATmega32u4 is Little-Endian, which matches from_le_bytes perfectly
             let data = StateAction {
                 phi: f32::from_le_bytes(buf[0..4].try_into().unwrap()),
                 phi_dot: f32::from_le_bytes(buf[4..8].try_into().unwrap()),
@@ -260,27 +267,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 u: f32::from_le_bytes(buf[16..20].try_into().unwrap()),
             };
 
+            // --- Once per second feedback ---
+            loop_counter += 1;
+            if loop_counter >= 100 {
+                println!(
+                    "[Live] Tilt: {:>6.2}° | Wheel: {:>6.2} | Motor: {:>6.2}",
+                    data.phi.to_degrees(),
+                    data.theta,
+                    data.u
+                );
+                loop_counter = 0;
+            }
+
             state_batch.push(data);
         } else {
-            // Note: If the Arduino falls behind, you will see timeout errors here.
-            // This is safer than freezing the whole thread!
-            // eprintln!("UART Read Error/Timeout");
+            // Throttled error message so it doesn't flood the console
+            loop_counter += 1;
+            if loop_counter >= 100 {
+                eprintln!("[!] UART Timeout: Is the Arduino sending data?");
+                loop_counter = 0;
+            }
         }
 
         // 3. Check if the batch is full
         if state_batch.len() >= SAMPLES_PER_ITER {
-            // Efficiently swap out the full batch for an empty one
             let batch_to_process =
                 std::mem::replace(&mut state_batch, Vec::with_capacity(SAMPLES_PER_ITER));
 
-            // Clone the Arcs for the background thread
             let serial_clone = Arc::clone(&serial_bus);
             let k_clone = Arc::clone(&current_k);
 
-            // Spawn a detached thread to handle the math and writing
             thread::spawn(move || {
                 let k_to_use = { *k_clone.lock().unwrap() };
-
                 let new_k_mat = calculate_k(batch_to_process, &k_to_use);
 
                 {
@@ -294,13 +312,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     new_k_mat[(0, 3)] as f32,
                 ];
 
-                // e. Push to Arduino via UART
                 write_gains(&serial_clone, new_k_array);
-                println!("Pushed new K vector to Arduino.");
+                println!(">>> LSTDQ Update: Pushed new K vector to Arduino.");
             });
         }
 
-        // 4. Maintain a strict 100Hz (10ms) polling rate
         let elapsed = start_time.elapsed();
         let target_duration = Duration::from_millis(10);
 
