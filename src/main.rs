@@ -232,7 +232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let baud_rate = 115200;
 
     let port = serialport::new(port_name, baud_rate)
-        .timeout(Duration::from_millis(10))
+        .timeout(Duration::from_millis(100))
         .open()?;
 
     let serial_bus = Arc::new(Mutex::new(port));
@@ -244,8 +244,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut state_batch: Vec<StateAction> = Vec::with_capacity(SAMPLES_PER_ITER);
 
-    // --- Counter for throttled feedback ---
     let mut loop_counter = 0;
+    let mut is_connected = true;
+    let wake_up_time = Instant::now();
 
     println!("Starting 100Hz control loop on {}...", port_name);
 
@@ -259,6 +260,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         if read_result.is_ok() {
+            if !is_connected {
+                println!(
+                    "[+] CONNECTION RESTORED: Resuming control loop at {}.",
+                    wake_up_time.elapsed().as_secs_f32()
+                );
+                is_connected = true;
+            }
             let data = StateAction {
                 phi: f32::from_le_bytes(buf[0..4].try_into().unwrap()),
                 phi_dot: f32::from_le_bytes(buf[4..8].try_into().unwrap()),
@@ -281,11 +289,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             state_batch.push(data);
         } else {
-            // Throttled error message so it doesn't flood the console
-            loop_counter += 1;
-            if loop_counter >= 100 {
-                eprintln!("[!] UART Timeout: Is the Arduino sending data?");
-                loop_counter = 0;
+            if is_connected {
+                eprintln!(
+                    "[!] CONNECTION LOST: Watchdog timeout (100ms) at {}.",
+                    wake_up_time.elapsed().as_secs_f32()
+                );
+                is_connected = false;
             }
         }
 
@@ -315,13 +324,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 write_gains(&serial_clone, new_k_array);
                 println!(">>> LSTDQ Update: Pushed new K vector to Arduino.");
             });
-        }
-
-        let elapsed = start_time.elapsed();
-        let target_duration = Duration::from_millis(10);
-
-        if elapsed < target_duration {
-            thread::sleep(target_duration - elapsed);
         }
     }
 }
