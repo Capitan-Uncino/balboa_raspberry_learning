@@ -2,11 +2,17 @@ use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 
 use serialport::SerialPort;
 use std::convert::TryInto;
-use std::io::{Read, Write};
+use std::env;
+use std::error::Error;
+use std::fs::File;
+use std::io::{self, Read, Write};
 
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const ONLINE: bool = false;
+const NEW_BATCH: bool = true;
 
 const BALBOA_ADDR: u16 = 20;
 
@@ -223,11 +229,26 @@ fn write_gains(serial_bus: &Arc<Mutex<Box<dyn SerialPort>>>, gains: [f32; 4]) {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     println!("========================================");
     println!("    BALBOA BRAIN v2.0 - UART ENABLED    ");
     println!("========================================");
+    println!("Mode flags: ONLINE={}, NEW_BATCH={}", ONLINE, NEW_BATCH);
 
+    if ONLINE {
+        run_online_mode()?;
+    } else if NEW_BATCH {
+        run_data_collection_mode()?;
+    } else {
+        run_offline_computation_mode()?;
+    }
+
+    Ok(())
+}
+
+/// Mode 1: ONLINE = true
+/// Preserves your original control loop and LSTDQ update thread entirely.
+fn run_online_mode() -> Result<(), Box<dyn Error>> {
     let port_name = "/dev/ttyS0";
     let baud_rate = 115200;
 
@@ -237,7 +258,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let serial_bus = Arc::new(Mutex::new(port));
 
-    let initial_k_mat = SMatrix::<f64, 1, 4>::from_row_slice(&[100.0, 5.0, 2.0, 0.5]);
+    // Note: ensure SMatrix is in scope
+    let initial_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&[100.0, 5.0, 2.0, 0.5]);
     let current_k = Arc::new(Mutex::new(initial_k_mat));
 
     write_gains(&serial_bus, [100.0f32, 5.0, 2.0, 0.5]);
@@ -251,7 +273,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting 100Hz control loop on {}...", port_name);
 
     loop {
-        let start_time = Instant::now();
+        // let start_time = Instant::now(); // kept from original if you use it later
         let mut buf = [0u8; 20];
 
         let read_result = {
@@ -326,4 +348,115 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
     }
+}
+
+/// Mode 2: ONLINE = false, NEW_BATCH = true
+/// Listens to UART, forms batches, and writes them continuously to CSV files.
+fn run_data_collection_mode() -> Result<(), Box<dyn Error>> {
+    let port_name = "/dev/ttyS0";
+    let baud_rate = 115200;
+
+    let mut port = serialport::new(port_name, baud_rate)
+        .timeout(Duration::from_millis(100))
+        .open()?;
+
+    let mut state_batch: Vec<StateAction> = Vec::with_capacity(SAMPLES_PER_ITER);
+    let mut file_index = 0;
+
+    println!(
+        "Started data collection mode. Listening to {}...",
+        port_name
+    );
+
+    loop {
+        let mut buf = [0u8; 20];
+        if port.read_exact(&mut buf).is_ok() {
+            let data = StateAction {
+                phi: f32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                phi_dot: f32::from_le_bytes(buf[4..8].try_into().unwrap()),
+                theta: f32::from_le_bytes(buf[8..12].try_into().unwrap()),
+                theta_dot: f32::from_le_bytes(buf[12..16].try_into().unwrap()),
+                u: f32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            };
+
+            state_batch.push(data);
+
+            if state_batch.len() >= SAMPLES_PER_ITER {
+                let filename = format!("batch_{}.csv", file_index);
+                let mut file = File::create(&filename)?;
+
+                // Write CSV header
+                writeln!(file, "phi,phi_dot,theta,theta_dot,u")?;
+
+                // Write data
+                for state in &state_batch {
+                    writeln!(
+                        file,
+                        "{},{},{},{},{}",
+                        state.phi, state.phi_dot, state.theta, state.theta_dot, state.u
+                    )?;
+                }
+
+                println!(
+                    ">>> Saved batch of size {} to {}",
+                    SAMPLES_PER_ITER, filename
+                );
+
+                state_batch.clear();
+                file_index += 1;
+            }
+        }
+    }
+}
+
+/// Mode 3: ONLINE = false, NEW_BATCH = false
+/// Prompts for a filename, loads the CSV into a batch, computes K, and prints it.
+fn run_offline_computation_mode() -> Result<(), Box<dyn Error>> {
+    print!("Enter the CSV file name to process (e.g., batch_0.csv): ");
+    io::stdout().flush()?;
+
+    let mut filename = String::new();
+    io::stdin().read_line(&mut filename)?;
+    let filename = filename.trim();
+
+    println!("Reading data from {}...", filename);
+    let mut file = File::open(filename)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    let mut batch: Vec<StateAction> = Vec::new();
+
+    // Skip the header row
+    for line in contents.lines().skip(1) {
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() == 5 {
+            batch.push(StateAction {
+                phi: parts[0].parse()?,
+                phi_dot: parts[1].parse()?,
+                theta: parts[2].parse()?,
+                theta_dot: parts[3].parse()?,
+                u: parts[4].parse()?,
+            });
+        }
+    }
+
+    if batch.is_empty() {
+        println!("No valid data found in file.");
+        return Ok(());
+    }
+
+    println!("Loaded {} records. Computing K...", batch.len());
+
+    // Provide the initial K matrix required for computation
+    let initial_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&[100.0, 5.0, 2.0, 0.5]);
+
+    // Call the computation algorithm
+    let new_k_mat = calculate_k(batch, &initial_k_mat);
+
+    println!("========================================");
+    println!(">>> COMPUTED K MATRIX RESULT <<<");
+    println!("{}", new_k_mat);
+    println!("========================================");
+
+    Ok(())
 }
