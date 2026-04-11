@@ -1,20 +1,18 @@
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 
-use serialport::SerialPort;
+use rppal::gpio::{Gpio, Trigger};
+use rppal::i2c::I2c;
 use std::convert::TryInto;
-use std::env;
 use std::error::Error;
+use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
-
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const ONLINE: bool = false;
 const NEW_BATCH: bool = true;
-
-const BALBOA_ADDR: u16 = 20;
 
 #[derive(Debug, Clone, Copy)]
 pub struct StateAction {
@@ -203,35 +201,176 @@ fn calculate_k(
     compute_k_from_h(&h_mat)
 }
 
-fn write_gains(serial_bus: &Arc<Mutex<Box<dyn SerialPort>>>, gains: [f32; 4]) {
-    let mut write_buf = Vec::with_capacity(16);
-
-    // Pack the 4 floats into little-endian bytes
-    for k in gains {
+fn write_gains(i2c_bus: &Arc<Mutex<I2c>>, gains: [f32; 4]) {
+    let mut write_buf = Vec::with_capacity(17);
+    write_buf.push(0u8); // Offset 0
+    for k in &gains {
         write_buf.extend_from_slice(&k.to_le_bytes());
     }
 
-    if let Ok(mut port) = serial_bus.lock() {
-        // Console feedback so you know exactly what LSTDQ is deciding
+    if let Ok(mut i2c) = i2c_bus.lock() {
         println!(
             "---> Sending Gains: [k1: {:.3}, k2: {:.3}, k3: {:.3}, k4: {:.3}]",
             gains[0], gains[1], gains[2], gains[3]
         );
 
-        if let Err(e) = port.write_all(&write_buf) {
-            eprintln!("UART Write Error: {:?}", e);
-        } else {
-            // Force the OS to push the bytes out the TX pin right now
-            let _ = port.flush();
+        if let Err(e) = i2c.write(&write_buf) {
+            eprintln!("I2C Write Error: {:?}", e);
         }
     } else {
-        eprintln!("Failed to acquire UART lock for writing.");
+        eprintln!("Failed to acquire I2C lock for writing.");
     }
+}
+
+fn log_progress(current: usize, total: usize, completed: usize, mode: &str) {
+    let step = (total / 10).max(1);
+    if current > 0 && current % step == 0 {
+        let percent = (current as f32 / total as f32) * 100.0;
+        let bars = (percent / 10.0) as usize;
+        let bar_str = format!("[{}{}]", "=".repeat(bars), " ".repeat(10 - bars));
+
+        println!(
+            "[INFO] {} {} {:>3.0}% ({:>4}/{:>4}) | Total Completed: {}",
+            mode, bar_str, percent, current, total, completed
+        );
+    }
+}
+
+/// Scans the directory for batch_X.csv files and returns the next available index.
+fn get_next_file_index() -> usize {
+    let mut highest = 0;
+    if let Ok(entries) = fs::read_dir(".") {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("batch_") && name.ends_with(".csv") {
+                    // Extract X from "batch_X.csv"
+                    let parts: Vec<&str> = name.split('_').collect();
+                    if let Some(num_part) = parts.get(1) {
+                        if let Some(num_str) = num_part.split('.').next() {
+                            if let Ok(num) = num_str.parse::<usize>() {
+                                if num >= highest {
+                                    highest = num + 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    highest
+}
+
+fn collect_full_batch(
+    i2c_bus: &Arc<Mutex<I2c>>,
+    log_label: &str,
+    batch_index: usize,
+    was_balancing: &mut bool,
+    pending_gains: &Arc<Mutex<Option<[f32; 4]>>>,
+) -> Vec<StateAction> {
+    let mut state_batch = Vec::with_capacity(SAMPLES_PER_ITER);
+    let mut loop_counter = 0;
+
+    // --- HARDWARE SYNC SETUP ---
+    let gpio = Gpio::new().expect("Failed to initialize GPIO");
+    let mut sync_pin = gpio.get(22).expect("GPIO 22 busy").into_input();
+
+    sync_pin
+        .set_interrupt(Trigger::RisingEdge, None)
+        .expect("Failed to set interrupt");
+
+    let mut stability_counter = 0;
+    let stability_threshold = 10;
+    let stop_angle_rad = 60.0_f32.to_radians();
+
+    println!(">>> Syncing with Balboa Hardware Clock on GPIO 22...");
+
+    while state_batch.len() < SAMPLES_PER_ITER {
+        // 1. WAIT FOR ARDUINO SIGNAL (Blocks until Window Opens)
+        // 15ms timeout ensures we don't hang forever if the Arduino is off
+        let _ = sync_pin.poll_interrupt(true, Some(Duration::from_millis(15)));
+
+        // 2. STRICT ENFORCEMENT CHECK
+        // If the pin is no longer high, Linux stalled our thread. Skip this cycle!
+        if sync_pin.is_low() {
+            continue;
+        }
+
+        // 3. READ DATA OVER I2C
+        let mut buf = [0u8; 20];
+        let read_result = {
+            let mut bus = i2c_bus.lock().unwrap();
+            bus.read(&mut buf)
+        };
+
+        if let Ok(20) = read_result {
+            // =======================================================
+            // 4. WRITE NEW GAINS (IF READY)
+            // Done immediately after reading while window is still open
+            // =======================================================
+            if let Some(new_gains) = pending_gains.lock().unwrap().take() {
+                write_gains(i2c_bus, new_gains);
+            }
+
+            // 5. PARSE BYTES
+            let data = StateAction {
+                phi: f32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                phi_dot: f32::from_le_bytes(buf[4..8].try_into().unwrap()),
+                theta: f32::from_le_bytes(buf[8..12].try_into().unwrap()),
+                theta_dot: f32::from_le_bytes(buf[12..16].try_into().unwrap()),
+                u: f32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            };
+
+            // 6. DATA SANITY CHECKS
+            let is_sane = data.theta.is_finite() && data.theta_dot.abs() < 100.0;
+            let is_upright = data.theta < 900.0 && data.theta.abs() < stop_angle_rad;
+
+            // 7. STABILITY LOGIC
+            if is_sane && is_upright {
+                stability_counter += 1;
+                if stability_counter >= stability_threshold {
+                    if !*was_balancing {
+                        println!(">>> ROBOT STANDING: Resuming {}...", log_label);
+                        *was_balancing = true;
+                    }
+
+                    state_batch.push(data);
+                    loop_counter += 1;
+
+                    // Progress logging
+                    if loop_counter >= 100 {
+                        log_progress(state_batch.len(), SAMPLES_PER_ITER, batch_index, log_label);
+                        loop_counter = 0;
+                    }
+                }
+            } else {
+                // If data is corrupted or robot is down, reset the stability window
+                stability_counter = 0;
+                if *was_balancing {
+                    println!(
+                        "<<< ROBOT FELL: Pausing {} (Collected: {}/{})",
+                        log_label,
+                        state_batch.len(),
+                        SAMPLES_PER_ITER
+                    );
+                    *was_balancing = false;
+                }
+            }
+        } else {
+            // I2C read failed, reset stability
+            stability_counter = 0;
+        }
+    }
+
+    // Clean up interrupt before exiting so it doesn't leak or conflict later
+    let _ = sync_pin.clear_interrupt();
+
+    state_batch
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("========================================");
-    println!("    BALBOA BRAIN v2.0 - UART ENABLED    ");
+    println!("    BALBOA BRAIN v2.0 - I2C ENABLED     ");
     println!("========================================");
     println!("Mode flags: ONLINE={}, NEW_BATCH={}", ONLINE, NEW_BATCH);
 
@@ -246,166 +385,107 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Mode 1: ONLINE = true
-/// Preserves your original control loop and LSTDQ update thread entirely.
 fn run_online_mode() -> Result<(), Box<dyn Error>> {
-    let port_name = "/dev/ttyS0";
-    let baud_rate = 115200;
+    let mut i2c = I2c::new().map_err(|e| format!("Failed to init I2C: {}", e))?;
+    i2c.set_slave_address(0x08)
+        .map_err(|e| format!("Failed to set I2C address: {}", e))?;
+    let i2c_bus = Arc::new(Mutex::new(i2c));
 
-    let port = serialport::new(port_name, baud_rate)
-        .timeout(Duration::from_millis(100))
-        .open()?;
-
-    let serial_bus = Arc::new(Mutex::new(port));
-
-    // Note: ensure SMatrix is in scope
     let initial_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&[100.0, 5.0, 2.0, 0.5]);
     let current_k = Arc::new(Mutex::new(initial_k_mat));
 
-    write_gains(&serial_bus, [100.0f32, 5.0, 2.0, 0.5]);
+    // NEW: Shared state to hold gains computed by the background thread
+    let pending_gains: Arc<Mutex<Option<[f32; 4]>>> = Arc::new(Mutex::new(None));
 
-    let mut state_batch: Vec<StateAction> = Vec::with_capacity(SAMPLES_PER_ITER);
+    let mut computations_completed = 0;
+    let mut was_balancing = false;
 
-    let mut loop_counter = 0;
-    let mut is_connected = true;
-    let wake_up_time = Instant::now();
-
-    println!("Starting 100Hz control loop on {}...", port_name);
+    println!("Starting 100Hz I2C control loop on Address 0x08...");
 
     loop {
-        // let start_time = Instant::now(); // kept from original if you use it later
-        let mut buf = [0u8; 20];
+        let batch_to_process = collect_full_batch(
+            &i2c_bus,
+            "LSTDQ Batch",
+            computations_completed,
+            &mut was_balancing,
+            &pending_gains, // Pass the shared state
+        );
 
-        let read_result = {
-            let mut bus = serial_bus.lock().unwrap();
-            bus.read_exact(&mut buf)
-        };
+        computations_completed += 1;
+        let k_clone = Arc::clone(&current_k);
+        let pending_clone = Arc::clone(&pending_gains);
 
-        if read_result.is_ok() {
-            if !is_connected {
-                println!(
-                    "[+] CONNECTION RESTORED: Resuming control loop at {}.",
-                    wake_up_time.elapsed().as_secs_f32()
-                );
-                is_connected = true;
-            }
-            let data = StateAction {
-                phi: f32::from_le_bytes(buf[0..4].try_into().unwrap()),
-                phi_dot: f32::from_le_bytes(buf[4..8].try_into().unwrap()),
-                theta: f32::from_le_bytes(buf[8..12].try_into().unwrap()),
-                theta_dot: f32::from_le_bytes(buf[12..16].try_into().unwrap()),
-                u: f32::from_le_bytes(buf[16..20].try_into().unwrap()),
-            };
+        // Spawn math thread
+        thread::spawn(move || {
+            let k_to_use = { *k_clone.lock().unwrap() };
+            let new_k_mat = calculate_k(batch_to_process, &k_to_use);
 
-            // --- Once per second feedback ---
-            loop_counter += 1;
-            if loop_counter >= 100 {
-                println!(
-                    "[Live] Tilt: {:>6.2}° | Wheel: {:>6.2} | Motor: {:>6.2}",
-                    data.phi.to_degrees(),
-                    data.theta,
-                    data.u
-                );
-                loop_counter = 0;
+            {
+                *k_clone.lock().unwrap() = new_k_mat;
             }
 
-            state_batch.push(data);
-        } else {
-            if is_connected {
-                eprintln!(
-                    "[!] CONNECTION LOST: Watchdog timeout (100ms) at {}.",
-                    wake_up_time.elapsed().as_secs_f32()
-                );
-                is_connected = false;
-            }
-        }
+            let new_k_array = [
+                new_k_mat[(0, 0)] as f32,
+                new_k_mat[(0, 1)] as f32,
+                new_k_mat[(0, 2)] as f32,
+                new_k_mat[(0, 3)] as f32,
+            ];
 
-        // 3. Check if the batch is full
-        if state_batch.len() >= SAMPLES_PER_ITER {
-            let batch_to_process =
-                std::mem::replace(&mut state_batch, Vec::with_capacity(SAMPLES_PER_ITER));
-
-            let serial_clone = Arc::clone(&serial_bus);
-            let k_clone = Arc::clone(&current_k);
-
-            thread::spawn(move || {
-                let k_to_use = { *k_clone.lock().unwrap() };
-                let new_k_mat = calculate_k(batch_to_process, &k_to_use);
-
-                {
-                    *k_clone.lock().unwrap() = new_k_mat;
-                }
-
-                let new_k_array = [
-                    new_k_mat[(0, 0)] as f32,
-                    new_k_mat[(0, 1)] as f32,
-                    new_k_mat[(0, 2)] as f32,
-                    new_k_mat[(0, 3)] as f32,
-                ];
-
-                write_gains(&serial_clone, new_k_array);
-                println!(">>> LSTDQ Update: Pushed new K vector to Arduino.");
-            });
-        }
+            // Store the calculated gains so the main thread can grab them
+            // during its next 5ms hardware window
+            *pending_clone.lock().unwrap() = Some(new_k_array);
+            println!(">>> LSTDQ Update: New K vector queued for next I2C window.");
+        });
     }
 }
 
-/// Mode 2: ONLINE = false, NEW_BATCH = true
-/// Listens to UART, forms batches, and writes them continuously to CSV files.
 fn run_data_collection_mode() -> Result<(), Box<dyn Error>> {
-    let port_name = "/dev/ttyS0";
-    let baud_rate = 115200;
+    let mut i2c = I2c::new().map_err(|e| format!("Failed to init I2C: {}", e))?;
+    i2c.set_slave_address(0x08)
+        .map_err(|e| format!("Failed to set I2C address: {}", e))?;
+    let i2c_bus = Arc::new(Mutex::new(i2c));
 
-    let mut port = serialport::new(port_name, baud_rate)
-        .timeout(Duration::from_millis(100))
-        .open()?;
+    // SMART INDEX: Start from the highest existing file + 1
+    let mut file_index = get_next_file_index();
+    let mut was_balancing = false;
 
-    let mut state_batch: Vec<StateAction> = Vec::with_capacity(SAMPLES_PER_ITER);
-    let mut file_index = 0;
+    // NEW: Dummy container to satisfy the collect_full_batch signature
+    let dummy_pending_gains: Arc<Mutex<Option<[f32; 4]>>> = Arc::new(Mutex::new(None));
 
     println!(
-        "Started data collection mode. Listening to {}...",
-        port_name
+        "Started data collection mode. Will start at index: {}",
+        file_index
     );
 
     loop {
-        let mut buf = [0u8; 20];
-        if port.read_exact(&mut buf).is_ok() {
-            let data = StateAction {
-                phi: f32::from_le_bytes(buf[0..4].try_into().unwrap()),
-                phi_dot: f32::from_le_bytes(buf[4..8].try_into().unwrap()),
-                theta: f32::from_le_bytes(buf[8..12].try_into().unwrap()),
-                theta_dot: f32::from_le_bytes(buf[12..16].try_into().unwrap()),
-                u: f32::from_le_bytes(buf[16..20].try_into().unwrap()),
-            };
+        // Pass the dummy_pending_gains as the 5th argument
+        let batch_to_process = collect_full_batch(
+            &i2c_bus,
+            "CSV Collection",
+            file_index,
+            &mut was_balancing,
+            &dummy_pending_gains,
+        );
 
-            state_batch.push(data);
+        let filename = format!("batch_{}.csv", file_index);
+        let mut file = File::create(&filename)?;
 
-            if state_batch.len() >= SAMPLES_PER_ITER {
-                let filename = format!("batch_{}.csv", file_index);
-                let mut file = File::create(&filename)?;
-
-                // Write CSV header
-                writeln!(file, "phi,phi_dot,theta,theta_dot,u")?;
-
-                // Write data
-                for state in &state_batch {
-                    writeln!(
-                        file,
-                        "{},{},{},{},{}",
-                        state.phi, state.phi_dot, state.theta, state.theta_dot, state.u
-                    )?;
-                }
-
-                println!(
-                    ">>> Saved batch of size {} to {}",
-                    SAMPLES_PER_ITER, filename
-                );
-
-                state_batch.clear();
-                file_index += 1;
-            }
+        writeln!(file, "phi,phi_dot,theta,theta_dot,u")?;
+        for s in &batch_to_process {
+            writeln!(
+                file,
+                "{},{},{},{},{}",
+                s.phi, s.phi_dot, s.theta, s.theta_dot, s.u
+            )?;
         }
+
+        println!(
+            ">>> Saved batch of size {} to {} (Next: {})",
+            SAMPLES_PER_ITER,
+            filename,
+            file_index + 1
+        );
+        file_index += 1;
     }
 }
 
