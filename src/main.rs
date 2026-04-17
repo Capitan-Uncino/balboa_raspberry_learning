@@ -1,26 +1,40 @@
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 
+use mujoco_rs::prelude::*;
+use mujoco_rs::viewer::MjViewer;
+use rand::rng;
+use rand::RngExt;
 use rppal::gpio::{Gpio, Trigger};
 use rppal::i2c::I2c;
 use std::convert::TryInto;
 use std::error::Error;
+use std::f64::consts::PI;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const ONLINE: bool = false;
-const NEW_BATCH: bool = true;
+const ONLINE: bool = true;
+const NEW_BATCH: bool = false;
+const SIM: bool = true;
+const VISUALIZE: bool = true;
+
+const DT: f64 = 0.01;
+
+const THETA_OU: f64 = 0.30;
+const SIGMA_OU: f64 = 0.05;
+
+const ANALYTIC_LQR_POLICY: [f64; 4] = [0.182574, 4.412952, 0.098523, 0.441536];
 
 #[derive(Debug, Clone, Copy)]
 pub struct StateAction {
-    pub phi: f32,
-    pub phi_dot: f32,
-    pub theta: f32,
-    pub theta_dot: f32,
-    pub u: f32,
+    pub phi: f64,
+    pub theta: f64,
+    pub phi_dot: f64,
+    pub theta_dot: f64,
+    pub u: f64,
 }
 
 // --- System Dimensions ---
@@ -33,7 +47,8 @@ const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 const GAMMA: f64 = 0.99; // Discount factor
 const SAMPLES_PER_ITER: usize = 10000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
-const ETA: f64 = 1.068;
+                              //const ETA: f64 = SIGMA_OU * SIGMA_OU / (2.0 * THETA_OU - THETA_OU * THETA_OU * DT);
+const ETA: f64 = 0.0f64;
 
 fn get_quadratic_features(
     x: &SVector<f64, DIM_X>,
@@ -75,7 +90,7 @@ fn compute_k_from_h(h_mat: &SMatrix<f64, DIM_X_AND_U, DIM_X_AND_U>) -> SMatrix<f
     let q_uu = h_mat.fixed_view::<DIM_U, DIM_U>(DIM_X, DIM_X);
     let q_ux = h_mat.fixed_view::<DIM_U, DIM_X>(DIM_X, 0);
     match q_uu.try_inverse() {
-        Some(inv) => inv * q_ux,
+        Some(inv) => -inv * q_ux,
         None => SMatrix::<f64, DIM_U, DIM_X>::identity(),
     }
 }
@@ -99,15 +114,13 @@ pub fn run_lstdq(
     let mut a_mat = DMatrix::<f64>::zeros(DIM_PARAMS, DIM_PARAMS);
     let mut b_vec = DVector::<f64>::zeros(DIM_PARAMS);
 
-    // 1. Define your Q and R penalty matrices here since 'sys' is removed.
-    // Tune these to penalize chassis tilt vs wheel movement vs battery usage.
     let q_cost = SMatrix::<f64, DIM_X, DIM_X>::from_diagonal(&SVector::from([
-        10.0, // phi penalty
-        1.0,  // phi_dot penalty
-        1.0,  // theta penalty
-        0.1,  // theta_dot penalty
+        10.0,  // phi penalty
+        100.0, // theta penalty
+        1.0,   // phi_dot penalty
+        10.0,  // theta_dot penalty
     ]));
-    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([1.0]));
+    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([300.0]));
 
     // Construct matrix M = [I; K]
     let mut m_mat = SMatrix::<f64, DIM_X_AND_U, DIM_X>::zeros();
@@ -138,18 +151,18 @@ pub fn run_lstdq(
 
         // Construct mathematical vectors directly from the I2C structs
         let x = SVector::<f64, DIM_X>::from_column_slice(&[
-            current.phi as f64,
-            current.phi_dot as f64,
-            current.theta as f64,
-            current.theta_dot as f64,
+            current.phi,
+            current.theta,
+            current.phi_dot,
+            current.theta_dot,
         ]);
-        let u = SVector::<f64, DIM_U>::from_column_slice(&[current.u as f64]);
+        let u = SVector::<f64, DIM_U>::from_column_slice(&[current.u]);
 
         let x_next = SVector::<f64, DIM_X>::from_column_slice(&[
-            next.phi as f64,
-            next.phi_dot as f64,
-            next.theta as f64,
-            next.theta_dot as f64,
+            next.phi,
+            next.theta,
+            next.phi_dot,
+            next.theta_dot,
         ]);
 
         // Cost calculation using our local Q and R
@@ -159,7 +172,7 @@ pub fn run_lstdq(
         let phi = get_quadratic_features(&x, &u) + bias_vec;
 
         // Target policy uses the current gain matrix K (Greedy action)
-        let u_next_greedy = -k * x_next;
+        let u_next_greedy = k * x_next;
         let phi_next = get_quadratic_features(&x_next, &u_next_greedy) + bias_vec;
 
         // LSTDQ Update
@@ -281,7 +294,7 @@ fn collect_full_batch(
 
     let mut stability_counter = 0;
     let stability_threshold = 10;
-    let stop_angle_rad = 60.0_f32.to_radians();
+    let stop_angle_rad = 60.0_f64.to_radians();
 
     println!(">>> Syncing with Balboa Hardware Clock on GPIO 22...");
 
@@ -314,11 +327,11 @@ fn collect_full_batch(
 
             // 5. PARSE BYTES
             let data = StateAction {
-                phi: f32::from_le_bytes(buf[0..4].try_into().unwrap()),
-                phi_dot: f32::from_le_bytes(buf[4..8].try_into().unwrap()),
-                theta: f32::from_le_bytes(buf[8..12].try_into().unwrap()),
-                theta_dot: f32::from_le_bytes(buf[12..16].try_into().unwrap()),
-                u: f32::from_le_bytes(buf[16..20].try_into().unwrap()),
+                phi: f32::from_le_bytes(buf[0..4].try_into().unwrap()) as f64,
+                theta: f32::from_le_bytes(buf[4..8].try_into().unwrap()) as f64,
+                phi_dot: f32::from_le_bytes(buf[8..12].try_into().unwrap()) as f64,
+                theta_dot: f32::from_le_bytes(buf[12..16].try_into().unwrap()) as f64,
+                u: f32::from_le_bytes(buf[16..20].try_into().unwrap()) as f64,
             };
 
             // 6. DATA SANITY CHECKS
@@ -375,9 +388,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Mode flags: ONLINE={}, NEW_BATCH={}", ONLINE, NEW_BATCH);
 
     if ONLINE {
-        run_online_mode()?;
+        if SIM {
+            run_online_mode_sim()?;
+        } else {
+            run_online_mode()?;
+        }
     } else if NEW_BATCH {
-        run_data_collection_mode()?;
+        if SIM {
+            run_data_collection_mode_sim()?;
+        } else {
+            run_data_collection_mode()?;
+        }
     } else {
         run_offline_computation_mode()?;
     }
@@ -391,7 +412,7 @@ fn run_online_mode() -> Result<(), Box<dyn Error>> {
         .map_err(|e| format!("Failed to set I2C address: {}", e))?;
     let i2c_bus = Arc::new(Mutex::new(i2c));
 
-    let initial_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&[100.0, 5.0, 2.0, 0.5]);
+    let initial_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&ANALYTIC_LQR_POLICY);
     let current_k = Arc::new(Mutex::new(initial_k_mat));
 
     // NEW: Shared state to hold gains computed by the background thread
@@ -475,7 +496,7 @@ fn run_data_collection_mode() -> Result<(), Box<dyn Error>> {
             writeln!(
                 file,
                 "{},{},{},{},{}",
-                s.phi, s.phi_dot, s.theta, s.theta_dot, s.u
+                s.phi, s.theta, s.phi_dot, s.theta_dot, s.u
             )?;
         }
 
@@ -512,8 +533,8 @@ fn run_offline_computation_mode() -> Result<(), Box<dyn Error>> {
         if parts.len() == 5 {
             batch.push(StateAction {
                 phi: parts[0].parse()?,
-                phi_dot: parts[1].parse()?,
-                theta: parts[2].parse()?,
+                theta: parts[1].parse()?,
+                phi_dot: parts[2].parse()?,
                 theta_dot: parts[3].parse()?,
                 u: parts[4].parse()?,
             });
@@ -528,7 +549,7 @@ fn run_offline_computation_mode() -> Result<(), Box<dyn Error>> {
     println!("Loaded {} records. Computing K...", batch.len());
 
     // Provide the initial K matrix required for computation
-    let initial_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&[100.0, 5.0, 2.0, 0.5]);
+    let initial_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&ANALYTIC_LQR_POLICY);
 
     // Call the computation algorithm
     let new_k_mat = calculate_k(batch, &initial_k_mat);
@@ -538,5 +559,301 @@ fn run_offline_computation_mode() -> Result<(), Box<dyn Error>> {
     println!("{}", new_k_mat);
     println!("========================================");
 
+    Ok(())
+}
+
+fn collect_full_batch_sim<'a>(
+    model: &'a MjModel,
+    data: &mut MjData<&'a MjModel>,
+    viewer: &mut MjViewer,
+    log_label: &str,
+    batch_index: usize,
+    was_balancing: &mut bool,
+    pending_gains: &Arc<Mutex<Option<[f64; 4]>>>,
+    active_gains: &mut [f64; 4],
+    enable_rendering: bool, // NEW: Toggle visualization and pacing
+) -> Vec<StateAction> {
+    let mut state_batch = Vec::with_capacity(SAMPLES_PER_ITER);
+    let mut loop_counter = 0;
+    let mut stability_counter = 0;
+
+    let stability_threshold = 10;
+    let stop_angle_rad = 60.0_f64.to_radians();
+
+    let control_step = 0.01;
+    let timestep = model.opt().timestep;
+    let sim_steps = (control_step / timestep).round() as usize;
+
+    // --- OU NOISE PARAMETERS ---
+    let mut last_noise: f64 = 0.0;
+    let mut rng = rng();
+
+    // Calculate how much real time should pass per control step
+    let target_duration = Duration::from_secs_f64(control_step);
+
+    println!(">>> [SIM] Running MuJoCo Simulation Loop...");
+
+    // Only check if the viewer is running if rendering is actually enabled
+    while state_batch.len() < SAMPLES_PER_ITER && (!enable_rendering || viewer.running()) {
+        // Start the timer for real-time pacing
+        let step_start = Instant::now();
+
+        if let Some(new_gains) = pending_gains.lock().unwrap().take() {
+            println!("---> [SIM] Applying New Gains: {:?}", new_gains);
+            *active_gains = new_gains;
+        }
+
+        let qpos = data.qpos();
+        let qvel = data.qvel();
+
+        let qw = qpos[3];
+        let qx = qpos[4];
+        let qy = qpos[5];
+        let qz = qpos[6];
+        let theta = (2.0f64 * (qw * qy - qz * qx)).asin();
+
+        let phi_left = qpos[7];
+        let phi_right = qpos[8];
+        let phi = (phi_left + phi_right) / 2.0f64;
+
+        let theta_dot = qvel[4];
+        let phi_dot_left = qvel[6];
+        let phi_dot_right = qvel[7];
+        let phi_dot = (phi_dot_left + phi_dot_right) / 2.0f64;
+
+        let k1 = active_gains[0];
+        let k2 = active_gains[1];
+        let k3 = active_gains[2];
+        let k4 = active_gains[3];
+
+        // 1. LQR Control Law: u = -Kx
+        // (Note the negative sign at the front!)
+        let u_raw = k1 * phi + k2 * theta + k3 * phi_dot + k4 * theta_dot;
+
+        // ==========================================
+        // OU EXPLORATION NOISE
+        // ==========================================
+        let u1: f64 = rng.random_range(0.0001..1.0);
+        let u2: f64 = rng.random_range(0.0..1.0);
+        let epsilon = (-2.0f64 * u1.ln()).sqrt() * (2.0f64 * PI * u2).cos();
+        let dx = THETA_OU * (-last_noise) * 0.01 + SIGMA_OU * epsilon * 0.1;
+        last_noise += dx;
+
+        // 2. Add noise directly to the torque request
+        //let u_noisy = u_raw + last_noise;
+        let u_noisy = u_raw + last_noise;
+
+        // 3. Clamp to physical motor limits (0.1 Nm max torque per your Python script)
+        // DO NOT divide by 400!
+        let max_torque = 0.1;
+        let u_clamped = u_noisy.clamp(-max_torque, max_torque);
+
+        // ==========================================
+        // APPLY TO ACTUATORS
+        // ==========================================
+        data.ctrl_mut()[0] = u_clamped;
+        data.ctrl_mut()[1] = u_clamped;
+
+        for _ in 0..sim_steps {
+            data.step();
+        }
+
+        // ==========================================
+        // OPTIONAL RENDERING & REAL-TIME PACING
+        // ==========================================
+        if enable_rendering {
+            viewer.sync_data(data);
+            let _ = viewer.render();
+
+            let elapsed = step_start.elapsed();
+            if elapsed < target_duration {
+                thread::sleep(target_duration - elapsed);
+            }
+        }
+
+        let current_data = StateAction {
+            phi,
+            theta,
+            phi_dot,
+            theta_dot,
+            u: u_clamped,
+        };
+
+        let is_sane = current_data.theta.is_finite() && current_data.theta_dot.abs() < 100.0;
+        let is_upright = current_data.theta.abs() < stop_angle_rad;
+
+        if is_sane && is_upright {
+            stability_counter += 1;
+            if stability_counter >= stability_threshold {
+                if !*was_balancing {
+                    println!(">>> [SIM] ROBOT STANDING: Resuming {}...", log_label);
+                    *was_balancing = true;
+                }
+                state_batch.push(current_data);
+                loop_counter += 1;
+                if loop_counter >= 100 {
+                    log_progress(state_batch.len(), SAMPLES_PER_ITER, batch_index, log_label);
+                    loop_counter = 0;
+                }
+            }
+        } else {
+            stability_counter = 0;
+            if *was_balancing {
+                println!(
+                    "<<< [SIM] ROBOT FELL: Pausing {} (Collected: {}/{})",
+                    log_label,
+                    state_batch.len(),
+                    SAMPLES_PER_ITER
+                );
+                *was_balancing = false;
+
+                // Safe Reset (Quaternion reconstruction is still required)
+                data.reset();
+                data.qpos_mut()[2] = 0.05;
+                data.qpos_mut()[3] = 1.0; // W must be 1.0!
+                                          // We don't need to manually tilt it anymore; the OU noise will do it!
+
+                // Reset the noise history so it doesn't jump aggressively on respawn
+                last_noise = 0.0;
+            }
+        }
+    }
+
+    state_batch
+}
+
+fn run_online_mode_sim() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Loading MuJoCo model 'balboa.xml'...");
+
+    // mujoco-rs uses MjModel::from_xml for loading files
+    let model = MjModel::from_xml("balboa.xml").expect("Failed to load balboa.xml");
+
+    // Automatically allocates the physics state array based on the model
+    let mut data = model.make_data();
+
+    // Spawn the viewer in a background thread running at roughly 60 FPS
+    let mut viewer =
+        MjViewer::launch_passive(&model, 60).expect("Failed to initialize MuJoCo viewer");
+
+    let initial_k_array = ANALYTIC_LQR_POLICY;
+    let initial_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&[
+        initial_k_array[0],
+        initial_k_array[1],
+        initial_k_array[2],
+        initial_k_array[3],
+    ]);
+
+    let current_k = Arc::new(Mutex::new(initial_k_mat));
+    let pending_gains: Arc<Mutex<Option<[f64; 4]>>> = Arc::new(Mutex::new(None));
+    let mut active_gains = initial_k_array;
+
+    let mut computations_completed = 0;
+    let mut was_balancing = false;
+
+    println!("Starting [SIMULATED] 100Hz control loop...");
+
+    while viewer.running() {
+        let batch_to_process = collect_full_batch_sim(
+            &model,
+            &mut data,
+            &mut viewer,
+            "LSTDQ Batch",
+            computations_completed,
+            &mut was_balancing,
+            &pending_gains,
+            &mut active_gains,
+            VISUALIZE,
+        );
+
+        // Break out of the loop if the user clicked the 'X' during batch collection
+        if batch_to_process.is_empty() {
+            break;
+        }
+
+        computations_completed += 1;
+        let k_clone = Arc::clone(&current_k);
+        let pending_clone = Arc::clone(&pending_gains);
+
+        std::thread::spawn(move || {
+            let k_to_use = { *k_clone.lock().unwrap() };
+            let new_k_mat = calculate_k(batch_to_process, &k_to_use);
+
+            {
+                *k_clone.lock().unwrap() = new_k_mat;
+            }
+
+            let new_k_array = [
+                new_k_mat[(0, 0)],
+                new_k_mat[(0, 1)],
+                new_k_mat[(0, 2)],
+                new_k_mat[(0, 3)],
+            ];
+
+            *pending_clone.lock().unwrap() = Some(new_k_array);
+            println!(">>> LSTDQ Update: New K vector queued for next SIM window.");
+        });
+    }
+
+    Ok(())
+}
+
+fn run_data_collection_mode_sim() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Loading MuJoCo model 'balboa.xml'...");
+    let model = MjModel::from_xml("balboa.xml").expect("Failed to load balboa.xml");
+    let mut data = model.make_data();
+
+    // Initialize the visualizer window
+    let mut viewer =
+        MjViewer::launch_passive(&model, 60).expect("Failed to initialize MuJoCo viewer");
+
+    let mut file_index = get_next_file_index();
+    let mut was_balancing = false;
+    let dummy_pending_gains: Arc<Mutex<Option<[f64; 4]>>> = Arc::new(Mutex::new(None));
+
+    let mut active_gains = ANALYTIC_LQR_POLICY;
+
+    println!(
+        "Started [SIMULATED] data collection mode. Will start at index: {}",
+        file_index
+    );
+
+    while viewer.running() {
+        let batch_to_process = collect_full_batch_sim(
+            &model,
+            &mut data,
+            &mut viewer,
+            "CSV Collection",
+            file_index,
+            &mut was_balancing,
+            &dummy_pending_gains,
+            &mut active_gains,
+            VISUALIZE,
+        );
+
+        if batch_to_process.is_empty() {
+            break;
+        }
+
+        let filename = format!("batch_{}.csv", file_index);
+        let mut file = std::fs::File::create(&filename)?;
+
+        use std::io::Write;
+        writeln!(file, "phi,theta,phi_dot,theta_dot,u")?;
+        for s in &batch_to_process {
+            writeln!(
+                file,
+                "{},{},{},{},{}",
+                s.phi, s.theta, s.phi_dot, s.theta_dot, s.u
+            )?;
+        }
+
+        println!(
+            ">>> Saved SIM batch of size {} to {} (Next: {})",
+            SAMPLES_PER_ITER,
+            filename,
+            file_index + 1
+        );
+        file_index += 1;
+    }
     Ok(())
 }

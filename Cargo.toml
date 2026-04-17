@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nalgebra = "0.34.1"
-rand = "0.10.0"
+nalgebra = "0.34.2"
+rand = "0.10.1"
 rand_distr = "0.6.0"
 rppal = "0.22.1"
+mujoco-rs = { version = "3.0.1+mj-3.6.0", features = ["viewer-ui"] }
