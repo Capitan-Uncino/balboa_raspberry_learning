@@ -16,15 +16,19 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use plotters::prelude::*;
+use rand_distr::{Distribution, Normal};
+
 const ONLINE: bool = true;
 const NEW_BATCH: bool = false;
 const SIM: bool = true;
-const VISUALIZE: bool = true;
+const VISUALIZE: bool = false;
+const PLOT: bool = true;
 
 const DT: f64 = 0.01;
 
 const THETA_OU: f64 = 0.30;
-const SIGMA_OU: f64 = 0.05;
+const SIGMA_OU: f64 = 0.10;
 
 const ANALYTIC_LQR_POLICY: [f64; 4] = [0.182574, 4.412952, 0.098523, 0.441536];
 
@@ -47,7 +51,6 @@ const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 const GAMMA: f64 = 0.99; // Discount factor
 const SAMPLES_PER_ITER: usize = 10000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
-                              //const ETA: f64 = SIGMA_OU * SIGMA_OU / (2.0 * THETA_OU - THETA_OU * THETA_OU * DT);
 const ETA: f64 = 0.0f64;
 
 fn get_quadratic_features(
@@ -399,6 +402,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             run_data_collection_mode()?;
         }
+    } else if PLOT {
+        run_sim_plot()?
     } else {
         run_offline_computation_mode()?;
     }
@@ -571,7 +576,8 @@ fn collect_full_batch_sim<'a>(
     was_balancing: &mut bool,
     pending_gains: &Arc<Mutex<Option<[f64; 4]>>>,
     active_gains: &mut [f64; 4],
-    enable_rendering: bool, // NEW: Toggle visualization and pacing
+    enable_rendering: bool,
+    enable_noise: bool,
 ) -> Vec<StateAction> {
     let mut state_batch = Vec::with_capacity(SAMPLES_PER_ITER);
     let mut loop_counter = 0;
@@ -639,20 +645,47 @@ fn collect_full_batch_sim<'a>(
         let dx = THETA_OU * (-last_noise) * 0.01 + SIGMA_OU * epsilon * 0.1;
         last_noise += dx;
 
-        // 2. Add noise directly to the torque request
-        //let u_noisy = u_raw + last_noise;
-        let u_noisy = u_raw + last_noise;
+        // --- Constants (adjust based on your setup) ---
+        let max_physical_torque = 0.1;
+        let pwm_resolution = 400.0; // The Balboa 32U4 uses 400 for max speed
 
-        // 3. Clamp to physical motor limits (0.1 Nm max torque per your Python script)
-        // DO NOT divide by 400!
-        let max_torque = 0.1;
-        let u_clamped = u_noisy.clamp(-max_torque, max_torque);
+        // 2. Add noise
+        let tau_total = u_raw + last_noise;
 
-        // ==========================================
-        // APPLY TO ACTUATORS
-        // ==========================================
-        data.ctrl_mut()[0] = u_clamped;
-        data.ctrl_mut()[1] = u_clamped;
+        // 3. Split load
+        let raw_tau = tau_total / 2.0;
+
+        let raw_tau_offset = if phi_dot > 0.0f64 {
+            raw_tau + 0.00
+        } else {
+            raw_tau - 0.00
+        };
+
+        // 4. Back-EMF constraints (as before)
+        let max_speed = 25.0;
+        let avail_l = max_physical_torque * (0.0f64.max(1.0 - (phi_dot_left.abs() / max_speed)));
+        let avail_r = max_physical_torque * (0.0f64.max(1.0 - (phi_dot_right.abs() / max_speed)));
+
+        // 5. Quantization Step (Simulating the 8-bit/10-bit PWM resolution)
+        // First, normalize the requested torque to a -400 to 400 scale
+        let pwm_l_raw = (raw_tau_offset / max_physical_torque) * pwm_resolution;
+        let pwm_r_raw = (raw_tau_offset / max_physical_torque) * pwm_resolution;
+
+        // Round to the nearest integer step (the actual "quantization")
+        let pwm_l_quantized = pwm_l_raw.round();
+        let pwm_r_quantized = pwm_r_raw.round();
+
+        // Convert back to physical Torque (Nm) for MuJoCo
+        let tau_l_quantized = (pwm_l_quantized / pwm_resolution) * max_physical_torque;
+        let tau_r_quantized = (pwm_r_quantized / pwm_resolution) * max_physical_torque;
+
+        // 6. Final Clamp (Apply the dynamic Back-EMF limits)
+        let tau_l_final = tau_l_quantized.clamp(-avail_l, avail_l);
+        let tau_r_final = tau_r_quantized.clamp(-avail_r, avail_r);
+
+        // 7. Apply to actuators
+        data.ctrl_mut()[0] = tau_l_final;
+        data.ctrl_mut()[1] = tau_r_final;
 
         for _ in 0..sim_steps {
             data.step();
@@ -676,7 +709,7 @@ fn collect_full_batch_sim<'a>(
             theta,
             phi_dot,
             theta_dot,
-            u: u_clamped,
+            u: raw_tau,
         };
 
         let is_sane = current_data.theta.is_finite() && current_data.theta_dot.abs() < 100.0;
@@ -752,6 +785,8 @@ fn run_online_mode_sim() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Starting [SIMULATED] 100Hz control loop...");
 
+    let enable_noise = true;
+
     while viewer.running() {
         let batch_to_process = collect_full_batch_sim(
             &model,
@@ -763,6 +798,7 @@ fn run_online_mode_sim() -> Result<(), Box<dyn std::error::Error>> {
             &pending_gains,
             &mut active_gains,
             VISUALIZE,
+            enable_noise,
         );
 
         // Break out of the loop if the user clicked the 'X' during batch collection
@@ -828,6 +864,7 @@ fn run_data_collection_mode_sim() -> Result<(), Box<dyn std::error::Error>> {
             &dummy_pending_gains,
             &mut active_gains,
             VISUALIZE,
+            true,
         );
 
         if batch_to_process.is_empty() {
@@ -856,4 +893,308 @@ fn run_data_collection_mode_sim() -> Result<(), Box<dyn std::error::Error>> {
         file_index += 1;
     }
     Ok(())
+}
+
+pub fn run_sim_plot() -> Result<(), Box<dyn std::error::Error>> {
+    let n_policies = 10;
+    let n_updates = 10;
+    let policy_variance: f64 = 0.1; // Variance for the Gaussian noise
+
+    println!("Loading MuJoCo model 'balboa.xml'...");
+    let model = MjModel::from_xml("balboa.xml").expect("Failed to load balboa.xml");
+    let mut data = model.make_data();
+    let mut viewer = MjViewer::launch_passive(&model, 60).expect("Failed to init viewer");
+
+    let initial_k_array = ANALYTIC_LQR_POLICY;
+
+    // --- 1. Evaluate the Original Baseline Policy ---
+    println!("Evaluating original baseline policy...");
+    let baseline_cost = evaluate_policy_sim(&model, &mut data, initial_k_array, false);
+    println!("Baseline Cost: {:.4}", baseline_cost);
+
+    // --- 2. Generate N Policies via Gaussian Perturbation ---
+    let mut rng = rng();
+    // Normal takes (mean, standard_deviation). std_dev is sqrt(variance).
+    let normal_dist = Normal::new(1.0f64, policy_variance.sqrt()).unwrap();
+
+    let mut policies: Vec<[f64; 4]> = (0..n_policies)
+        .map(|_| {
+            [
+                initial_k_array[0] * normal_dist.sample(&mut rng),
+                initial_k_array[1] * normal_dist.sample(&mut rng),
+                initial_k_array[2] * normal_dist.sample(&mut rng),
+                initial_k_array[3] * normal_dist.sample(&mut rng),
+            ]
+        })
+        .collect();
+
+    // To track the empirical cost evolution: costs[policy_idx][update_idx]
+    let mut cost_history: Vec<Vec<f64>> = vec![Vec::new(); n_policies];
+
+    // --- 3. Main Loop: Evaluation & Update ---
+    println!("Starting multi-policy evaluation and update loop...");
+
+    for update_idx in 0..n_updates {
+        println!("--- Update Step {} / {} ---", update_idx + 1, n_updates);
+
+        for (p_idx, policy) in policies.iter_mut().enumerate() {
+            // A) EVALUATION PHASE (Noise OFF)
+            let empirical_cost = evaluate_policy_sim(&model, &mut data, *policy, false);
+            cost_history[p_idx].push(empirical_cost);
+            println!("  Policy {} - Eval Cost: {:.4}", p_idx, empirical_cost);
+
+            // B) BATCH COLLECTION PHASE (Noise ON)
+            let mut active_gains = *policy;
+            // We still use Arc/Mutex here to satisfy your existing function signature,
+            // though the background thread is no longer strictly necessary in this sequential flow.
+            let pending_gains: Arc<Mutex<Option<[f64; 4]>>> = Arc::new(Mutex::new(None));
+            let mut was_balancing = false;
+
+            let batch_to_process = collect_full_batch_sim(
+                &model,
+                &mut data,
+                &mut viewer,
+                &format!("LSTDQ P{} U{}", p_idx, update_idx),
+                update_idx,
+                &mut was_balancing,
+                &pending_gains,
+                &mut active_gains,
+                VISUALIZE,
+                true, // enable_noise = true
+            );
+
+            if batch_to_process.is_empty() {
+                println!("  [!] Batch empty, user likely exited early.");
+                continue;
+            }
+
+            // C) UPDATE PHASE (Synchronous)
+            // Because we need the new K for the *next* update_idx, we compute it synchronously
+            // instead of spawning a disconnected thread.
+            let current_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(policy);
+            let new_k_mat = calculate_k(batch_to_process, &current_k_mat);
+
+            // Overwrite the current policy with the newly computed LSTDQ gains
+            *policy = [
+                new_k_mat[(0, 0)],
+                new_k_mat[(0, 1)],
+                new_k_mat[(0, 2)],
+                new_k_mat[(0, 3)],
+            ];
+        }
+    }
+
+    // --- 4. Final Evaluation ---
+    // Evaluate one last time to capture the cost *after* the final update
+    for (p_idx, policy) in policies.iter().enumerate() {
+        let final_cost = evaluate_policy_sim(&model, &mut data, *policy, false);
+        cost_history[p_idx].push(final_cost);
+    }
+
+    // --- 5. Plotting ---
+    println!("Generating plot 'policy_evolution.png'...");
+    plot_cost_evolution(&cost_history, baseline_cost, n_updates)?;
+
+    Ok(())
+}
+
+fn plot_cost_evolution(
+    costs: &[Vec<f64>],
+    baseline_cost: f64,
+    n_updates: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let root = BitMapBackend::new("policy_evolution.png", (1024, 768)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    // Find max cost to scale the Y axis
+    let max_cost = costs
+        .iter()
+        .flatten()
+        .copied()
+        .fold(f64::NAN, f64::max)
+        .max(baseline_cost);
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Empirical LQR Cost over Updates", ("sans-serif", 40))
+        .margin(20)
+        .x_label_area_size(40)
+        .y_label_area_size(60)
+        .build_cartesian_2d(0..n_updates, 0.0..(max_cost * 1.1))?;
+
+    chart
+        .configure_mesh()
+        .x_desc("Update Iteration")
+        .y_desc("Empirical Cost")
+        .draw()?;
+
+    // Plot each perturbed policy
+    for (i, policy_costs) in costs.iter().enumerate() {
+        let color = Palette99::pick(i);
+        chart
+            .draw_series(LineSeries::new(
+                policy_costs.iter().enumerate().map(|(x, &y)| (x, y)),
+                color.stroke_width(2),
+            ))?
+            .label(format!("Policy {}", i))
+            .legend(move |(x, y)| {
+                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+            });
+    }
+
+    // Plot the original policy baseline as a horizontal line for comparison
+    chart
+        .draw_series(LineSeries::new(
+            (0..=n_updates).map(|x| (x, baseline_cost)),
+            BLACK.stroke_width(4),
+        ))?
+        .label(format!("Original Policy (Cost: {:.2})", baseline_cost))
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLACK.stroke_width(4)));
+
+    chart
+        .configure_series_labels()
+        .background_style(&WHITE.mix(0.8))
+        .border_style(&BLACK)
+        .position(SeriesLabelPosition::UpperRight)
+        .draw()?;
+
+    root.present()?;
+    Ok(())
+}
+
+pub fn evaluate_policy_sim<'a>(
+    model: &'a MjModel,
+    data: &mut MjData<&'a MjModel>,
+    policy_gains: [f64; 4],
+    enable_noise: bool,
+) -> f64 {
+    // --- EVALUATION PARAMETERS ---
+    let eval_steps = 1000; // 10 seconds of simulation at 100Hz
+    let control_step: f64 = 0.01;
+    let timestep: f64 = model.opt().timestep;
+    let sim_steps = (control_step / timestep).round() as usize;
+    let stop_angle_rad = 60.0_f64.to_radians();
+
+    // --- LQR COST WEIGHTS ---
+    // Q = diag([10.0, 100.0, 1.0, 10.0])
+    let q_phi = 10.0;
+    let q_theta = 100.0;
+    let q_phi_dot = 1.0;
+    let q_theta_dot = 10.0;
+    // R = [[300.0]]
+    let r_tau = 300.0;
+
+    // --- RESET SIMULATION ---
+    // Start from a clean, upright state for a fair evaluation of the policy
+    data.reset();
+    data.qpos_mut()[2] = 0.05; // Starting elevation
+    data.qpos_mut()[3] = 1.0; // W component of quaternion must be 1.0
+
+    let mut total_cost = 0.0;
+
+    // OU Noise setup
+    let mut last_noise: f64 = 0.0;
+    let mut rng = rng();
+
+    for step in 0..eval_steps {
+        // --- 1. EXTRACT STATE ---
+        let qpos = data.qpos();
+        let qvel = data.qvel();
+
+        let qw = qpos[3];
+        let qx = qpos[4];
+        let qy = qpos[5];
+        let qz = qpos[6];
+        let theta = (2.0f64 * (qw * qy - qz * qx)).asin();
+
+        let phi_left = qpos[7];
+        let phi_right = qpos[8];
+        let phi = (phi_left + phi_right) / 2.0f64;
+
+        let theta_dot = qvel[4];
+        let phi_dot_left = qvel[6];
+        let phi_dot_right = qvel[7];
+        let phi_dot = (phi_dot_left + phi_dot_right) / 2.0f64;
+
+        // --- 2. STABILITY CHECK ---
+        let is_sane = theta.is_finite() && theta_dot.abs() < 100.0;
+        let is_upright = theta.abs() < stop_angle_rad;
+
+        if !is_sane || !is_upright {
+            // If the robot falls, heavily penalize the remaining timesteps
+            // to aggressively filter out unstable policies.
+            let penalty_per_step = 100_000.0;
+            total_cost += penalty_per_step * (eval_steps - step) as f64;
+            break;
+        }
+
+        // --- 3. LQR CONTROL LAW ---
+        let k1 = policy_gains[0];
+        let k2 = policy_gains[1];
+        let k3 = policy_gains[2];
+        let k4 = policy_gains[3];
+
+        let u_raw = k1 * phi + k2 * theta + k3 * phi_dot + k4 * theta_dot;
+
+        // --- 4. OPTIONAL NOISE ---
+        if enable_noise {
+            let u1: f64 = rng.random_range(0.0001..1.0);
+            let u2: f64 = rng.random_range(0.0..1.0);
+            let epsilon = (-2.0f64 * u1.ln()).sqrt() * (2.0f64 * PI * u2).cos();
+            let dx = THETA_OU * (-last_noise) * 0.01 + SIGMA_OU * epsilon * 0.1;
+            last_noise += dx;
+        } else {
+            last_noise = 0.0;
+        }
+
+        let tau_total = u_raw + last_noise;
+        let raw_tau = tau_total / 2.0;
+
+        // --- 5. EMPIRICAL COST CALCULATION ---
+        // J = x^T Q x + u^T R u
+        let state_cost = q_phi * phi.powi(2)
+            + q_theta * theta.powi(2)
+            + q_phi_dot * phi_dot.powi(2)
+            + q_theta_dot * theta_dot.powi(2);
+
+        let action_cost = r_tau * raw_tau.powi(2);
+
+        total_cost += state_cost + action_cost;
+
+        // --- 6. MOTOR REALISM (Quantization & Limits) ---
+        let raw_tau_offset = if phi_dot > 0.0f64 {
+            raw_tau + 0.00
+        } else {
+            raw_tau - 0.00
+        };
+
+        let max_physical_torque = 0.1;
+        let pwm_resolution = 400.0;
+        let max_speed = 25.0;
+
+        let avail_l = max_physical_torque * (0.0f64.max(1.0 - (phi_dot_left.abs() / max_speed)));
+        let avail_r = max_physical_torque * (0.0f64.max(1.0 - (phi_dot_right.abs() / max_speed)));
+
+        let pwm_l_raw = (raw_tau_offset / max_physical_torque) * pwm_resolution;
+        let pwm_r_raw = (raw_tau_offset / max_physical_torque) * pwm_resolution;
+
+        let pwm_l_quantized = pwm_l_raw.round();
+        let pwm_r_quantized = pwm_r_raw.round();
+
+        let tau_l_quantized = (pwm_l_quantized / pwm_resolution) * max_physical_torque;
+        let tau_r_quantized = (pwm_r_quantized / pwm_resolution) * max_physical_torque;
+
+        let tau_l_final = tau_l_quantized.clamp(-avail_l, avail_l);
+        let tau_r_final = tau_r_quantized.clamp(-avail_r, avail_r);
+
+        data.ctrl_mut()[0] = tau_l_final;
+        data.ctrl_mut()[1] = tau_r_final;
+
+        // --- 7. STEP SIMULATION ---
+        for _ in 0..sim_steps {
+            data.step();
+        }
+    }
+
+    // Return the averaged cost across all timesteps
+    total_cost / (eval_steps as f64)
 }
