@@ -288,6 +288,7 @@ pub fn run_data_collection_mode_sim(visualize: bool) -> Result<(), Box<dyn std::
     println!("Loading MuJoCo model 'balboa.xml'...");
     let model = MjModel::from_xml("balboa.xml").expect("Failed to load balboa.xml");
     let mut data = model.make_data();
+    let data_dir = "collected_data";
 
     // Initialize the visualizer window
     let mut viewer =
@@ -322,7 +323,7 @@ pub fn run_data_collection_mode_sim(visualize: bool) -> Result<(), Box<dyn std::
             break;
         }
 
-        let filename = format!("batch_{}.csv", file_index);
+        let filename = format!("{}/batch_{}.csv", data_dir, file_index);
         let mut file = std::fs::File::create(&filename)?;
 
         use std::io::Write;

@@ -2,6 +2,7 @@ use crate::learning::lstdq::{calculate_k, StateAction, ANALYTIC_LQR_POLICY};
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::path::Path;
 
 pub fn run_offline_computation_mode() -> Result<(), Box<dyn Error>> {
     print!("Enter the CSV file name to process (e.g., batch_0.csv): ");
@@ -12,6 +13,7 @@ pub fn run_offline_computation_mode() -> Result<(), Box<dyn Error>> {
     let filename = filename.trim();
 
     println!("Reading data from {}...", filename);
+    let filename = Path::new("collected_data").join(filename);
     let mut file = File::open(filename)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;

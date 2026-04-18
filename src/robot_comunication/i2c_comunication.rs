@@ -201,7 +201,7 @@ pub fn run_data_collection_mode() -> Result<(), Box<dyn Error>> {
     // SMART INDEX: Start from the highest existing file + 1
     let mut file_index = get_next_file_index();
     let mut was_balancing = false;
-
+    let data_dir = "collected_data";
     // NEW: Dummy container to satisfy the collect_full_batch signature
     let dummy_pending_gains: Arc<Mutex<Option<[f32; 4]>>> = Arc::new(Mutex::new(None));
 
@@ -220,7 +220,7 @@ pub fn run_data_collection_mode() -> Result<(), Box<dyn Error>> {
             &dummy_pending_gains,
         );
 
-        let filename = format!("batch_{}.csv", file_index);
+        let filename = format!("{}/batch_{}.csv", data_dir, file_index);
         let mut file = File::create(&filename)?;
 
         writeln!(file, "phi,phi_dot,theta,theta_dot,u")?;
