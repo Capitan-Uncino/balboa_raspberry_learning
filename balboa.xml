@@ -1,0 +1,60 @@
+<mujoco model="balboa_lab">
+  <compiler angle="degree" coordinate="local" inertiafromgeom="false"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <default>
+    <geom friction="2.5 0.1 0.01" margin="0.001"/>
+    <joint damping="0.01" frictionloss="0.01" armature="0.002"/> 
+  </default>
+
+  <asset>
+      <texture name="grid" type="2d" builtin="checker" rgb1=".1 .2 .3" rgb2=".2 .3 .4" width="800" height="800" mark="edge" markrgb=".1 .1 .1"/>
+      <material name="grid" texture="grid" texrepeat="1 1" texuniform="true"/>
+  </asset>
+
+  <worldbody>
+    <light directional="true" diffuse="0.8 0.8 0.8" pos="0 0 10" dir="0 0 -1"/>
+    <geom name="floor" type="plane" size="0 0 .05" material="grid" condim="4"/>
+
+    <body name="balboa_base" pos="0 0 0.04"> 
+
+      <freejoint name="root"/>
+
+      <inertial pos="0 0 0.023" mass="0.316" diaginertia="444.43e-6 444.43e-6 444.43e-6"/>
+      <geom name="body_geom" type="box" size="0.022 0.05 0.0545" pos="0 0 0.023" rgba="0 0.7 0 1"/>
+
+      <body name="left_motor_shaft" pos="0 0.05 0">
+        <joint name="left_motor_joint" type="hinge" axis="0 1 0"/>
+        
+        <inertial pos="0 0 0" mass="0.0005" diaginertia="1e-7 1e-7 1e-7"/>
+        
+        <geom name="left_shaft_geom" type="cylinder" size="0.01 0.005" euler="90 0 0" rgba="1 0 0 0" contype="0" conaffinity="0"/>
+
+        <body name="left_wheel" pos="0 0 0">
+          <joint name="left_backlash_joint" type="hinge" axis="0 1 0" limited="true" range="-1.5 1.5" damping="0.001" frictionloss="0" armature="0"/>
+          <inertial pos="0 0 0" mass="0.016" diaginertia="13.445e-6 13.445e-6 13.445e-6"/>
+          <geom name="wheel_l_geom" type="cylinder" size="0.04 0.005" euler="90 0 0" rgba="0.1 0.1 0.1 1"/>
+        </body>
+      </body>
+
+      <body name="right_motor_shaft" pos="0 -0.05 0">
+        <joint name="right_motor_joint" type="hinge" axis="0 1 0"/>
+        
+        <inertial pos="0 0 0" mass="0.0005" diaginertia="1e-7 1e-7 1e-7"/>
+        <geom name="right_shaft_geom" type="cylinder" size="0.01 0.005" euler="90 0 0" rgba="1 0 0 0" contype="0" conaffinity="0"/>
+
+        <body name="right_wheel" pos="0 0 0">
+          <joint name="right_backlash_joint" type="hinge" axis="0 1 0" limited="true" range="-1.5 1.5" damping="0.001" frictionloss="0" armature="0"/>
+          <inertial pos="0 0 0" mass="0.016" diaginertia="13.445e-6 13.445e-6 13.445e-6"/>
+          <geom name="wheel_r_geom" type="cylinder" size="0.04 0.005" euler="90 0 0" rgba="0.1 0.1 0.1 1"/>
+        </body>
+      </body>
+
+    </body>
+  </worldbody>
+
+<actuator>
+    <general name="left_motor" joint="left_motor_joint" ctrlrange="-1 1" forcerange="-0.1 0.1" dyntype="filter" dynprm="0.01"/>
+    <general name="right_motor" joint="right_motor_joint" ctrlrange="-1 1" forcerange="-0.1 0.1" dyntype="filter" dynprm="0.01"/>
+  </actuator>
+</mujoco>
