@@ -22,8 +22,8 @@ use rand_distr::{Distribution, Normal};
 const ONLINE: bool = true;
 const NEW_BATCH: bool = false;
 const SIM: bool = true;
-const VISUALIZE: bool = false;
-const PLOT: bool = true;
+const VISUALIZE: bool = true;
+const PLOT: bool = false;
 
 const DT: f64 = 0.01;
 
@@ -612,20 +612,24 @@ fn collect_full_batch_sim<'a>(
         let qpos = data.qpos();
         let qvel = data.qvel();
 
+        // --- 1. Pitch (Theta) Extraction ---
+        // Using atan2 is much more stable than asin for balancing robots.
+        // It handles the full 360-degree range and avoids NaN errors.
         let qw = qpos[3];
-        let qx = qpos[4];
         let qy = qpos[5];
-        let qz = qpos[6];
-        let theta = (2.0f64 * (qw * qy - qz * qx)).asin();
+        let theta = 2.0 * qy.atan2(qw);
+        let theta_dot = qvel[4]; // Pitch velocity (Y-axis angular velocity)
 
+        // --- 2. Wheel Position (Phi) Extraction ---
+        // Use the motor joints (7 and 9), not the backlash joints.
         let phi_left = qpos[7];
-        let phi_right = qpos[8];
-        let phi = (phi_left + phi_right) / 2.0f64;
+        let phi_right = qpos[9]; // Fixed index
+        let phi = (phi_left + phi_right) / 2.0;
 
-        let theta_dot = qvel[4];
+        // --- 3. Wheel Velocity (Phi_dot) Extraction ---
         let phi_dot_left = qvel[6];
-        let phi_dot_right = qvel[7];
-        let phi_dot = (phi_dot_left + phi_dot_right) / 2.0f64;
+        let phi_dot_right = qvel[8]; // Fixed index
+        let phi_dot = (phi_dot_left + phi_dot_right) / 2.0;
 
         let k1 = active_gains[0];
         let k2 = active_gains[1];
@@ -896,9 +900,9 @@ fn run_data_collection_mode_sim() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn run_sim_plot() -> Result<(), Box<dyn std::error::Error>> {
-    let n_policies = 10;
-    let n_updates = 10;
-    let policy_variance: f64 = 0.1; // Variance for the Gaussian noise
+    let n_policies = 2;
+    let n_updates = 3;
+    let policy_variance: f64 = 0.01; // Variance for the Gaussian noise
 
     println!("Loading MuJoCo model 'balboa.xml'...");
     let model = MjModel::from_xml("balboa.xml").expect("Failed to load balboa.xml");
@@ -935,6 +939,7 @@ pub fn run_sim_plot() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting multi-policy evaluation and update loop...");
 
     for update_idx in 0..n_updates {
+        println!("\r");
         println!("--- Update Step {} / {} ---", update_idx + 1, n_updates);
 
         for (p_idx, policy) in policies.iter_mut().enumerate() {
@@ -1100,21 +1105,24 @@ pub fn evaluate_policy_sim<'a>(
         let qpos = data.qpos();
         let qvel = data.qvel();
 
+        // --- 1. Pitch (Theta) Extraction ---
+        // Using atan2 is much more stable than asin for balancing robots.
+        // It handles the full 360-degree range and avoids NaN errors.
         let qw = qpos[3];
-        let qx = qpos[4];
         let qy = qpos[5];
-        let qz = qpos[6];
-        let theta = (2.0f64 * (qw * qy - qz * qx)).asin();
+        let theta = 2.0 * qy.atan2(qw);
+        let theta_dot = qvel[4]; // Pitch velocity (Y-axis angular velocity)
 
+        // --- 2. Wheel Position (Phi) Extraction ---
+        // Use the motor joints (7 and 9), not the backlash joints.
         let phi_left = qpos[7];
-        let phi_right = qpos[8];
-        let phi = (phi_left + phi_right) / 2.0f64;
+        let phi_right = qpos[9]; // Fixed index
+        let phi = (phi_left + phi_right) / 2.0;
 
-        let theta_dot = qvel[4];
+        // --- 3. Wheel Velocity (Phi_dot) Extraction ---
         let phi_dot_left = qvel[6];
-        let phi_dot_right = qvel[7];
-        let phi_dot = (phi_dot_left + phi_dot_right) / 2.0f64;
-
+        let phi_dot_right = qvel[8]; // Fixed index
+        let phi_dot = (phi_dot_left + phi_dot_right) / 2.0;
         // --- 2. STABILITY CHECK ---
         let is_sane = theta.is_finite() && theta_dot.abs() < 100.0;
         let is_upright = theta.abs() < stop_angle_rad;
