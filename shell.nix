@@ -6,7 +6,8 @@ pkgs.mkShell {
     pkg-config
     # Add these to override your broken global rustup
     rustc
-    cargo
+    cargo 
+    rust-analyzer
     gcc             # Provides the 'cc' linker
     binutils        # Provides 'ld' and other binary tools
   ];

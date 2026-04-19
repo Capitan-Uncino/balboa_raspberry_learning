@@ -54,7 +54,7 @@
   </worldbody>
 
 <actuator>
-    <general name="left_motor" joint="left_motor_joint" ctrlrange="-1 1" forcerange="-0.1 0.1" dyntype="filter" dynprm="0.01"/>
-    <general name="right_motor" joint="right_motor_joint" ctrlrange="-1 1" forcerange="-0.1 0.1" dyntype="filter" dynprm="0.01"/>
+    <general name="left_motor" joint="left_motor_joint" ctrlrange="-1 1" forcerange="-0.1 0.1" dyntype="filter" dynprm="0.001"/>
+    <general name="right_motor" joint="right_motor_joint" ctrlrange="-1 1" forcerange="-0.1 0.1" dyntype="filter" dynprm="0.001"/>
   </actuator>
 </mujoco>

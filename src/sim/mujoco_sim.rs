@@ -1,8 +1,11 @@
-use crate::learning::lstdq::{calculate_k, StateAction, ANALYTIC_LQR_POLICY, SAMPLES_PER_ITER};
+use crate::learning::lstdq_2019::{
+    calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, SAMPLES_PER_ITER,
+};
 use crate::utils::file_utils::get_next_file_index;
 use crate::utils::graphic_utils::{log_progress, plot_cost_evolution};
 use mujoco_rs::prelude::*;
 use mujoco_rs::viewer::MjViewer;
+use nalgebra::{SMatrix, SVector};
 use rand::rng;
 use rand::RngExt;
 use rand_distr::{Distribution, Normal};
@@ -220,6 +223,35 @@ pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Er
         MjViewer::launch_passive(&model, 60).expect("Failed to initialize MuJoCo viewer");
 
     let initial_k_array = ANALYTIC_LQR_POLICY;
+
+    let noise = estimate_process_noise(&model, &mut data);
+    println!("============================================================");
+    println!("       PROCESS NOISE DIAGNOSTIC REPORT");
+    println!("============================================================");
+
+    // 1. Print the Mean Vector (The "Bias")
+    println!("MEAN VECTOR (Systematic Bias / Residuals):");
+    println!("  [ φ_dot,     θ_dot,     φ_ddot,    θ_ddot ]");
+    println!(
+        "  [{:+.4e}, {:+.4e}, {:+.4e}, {:+.4e}]",
+        noise.0[0], noise.0[1], noise.0[2], noise.0[3]
+    );
+
+    // 2. Print the Covariance Matrix (The "Variance")
+    println!("\nCOVARIANCE MATRIX (Sigma):");
+    println!("            φ_dot           θ_dot           φ_ddot          θ_ddot");
+    let labels = ["φ_dot ", "θ_dot ", "φ_ddot", "θ_ddot"];
+    for i in 0..4 {
+        print!("{} ", labels[i]);
+        for j in 0..4 {
+            // Alignment is key here to see the diagonal vs off-diagonal
+            print!("{:>15.4e} ", noise.1[(i, j)]);
+        }
+        println!();
+    }
+
+    println!("============================================================");
+
     let initial_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&[
         initial_k_array[0],
         initial_k_array[1],
@@ -263,7 +295,7 @@ pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Er
 
         std::thread::spawn(move || {
             let k_to_use = { *k_clone.lock().unwrap() };
-            let new_k_mat = calculate_k(batch_to_process, &k_to_use);
+            let new_k_mat = calculate_k(batch_to_process, &k_to_use, &noise.1);
 
             {
                 *k_clone.lock().unwrap() = new_k_mat;
@@ -359,6 +391,8 @@ pub fn run_sim_plot(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     let initial_k_array = ANALYTIC_LQR_POLICY;
 
+    let noise = estimate_process_noise(&model, &mut data);
+
     // --- 1. Evaluate the Original Baseline Policy ---
     println!("Evaluating original baseline policy...");
     let baseline_cost = evaluate_policy_sim(&model, &mut data, initial_k_array, false);
@@ -425,7 +459,7 @@ pub fn run_sim_plot(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
             // Because we need the new K for the *next* update_idx, we compute it synchronously
             // instead of spawning a disconnected thread.
             let current_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(policy);
-            let new_k_mat = calculate_k(batch_to_process, &current_k_mat);
+            let new_k_mat = calculate_k(batch_to_process, &current_k_mat, &noise.1);
 
             // Overwrite the current policy with the newly computed LSTDQ gains
             *policy = [
@@ -590,4 +624,214 @@ fn evaluate_policy_sim<'a>(
 
     // Return the averaged cost across all timesteps
     total_cost / (eval_steps as f64)
+}
+
+// --- 1. CALCULATE ANALYTICAL A AND B MATRICES ---
+/*
+let mw: f64 = 0.0042;
+let mp: f64 = 0.316;
+let r: f64 = 0.040;
+let l: f64 = 0.023;
+let ip: f64 = 444.43e-6;
+let iw: f64 = 26.89e-6;
+let g: f64 = 9.81;
+*/
+
+pub fn estimate_process_noise<'a>(
+    model: &'a MjModel,
+    data: &mut MjData<&'a MjModel>,
+) -> (SVector<f64, DIM_X>, SMatrix<f64, DIM_X, DIM_X>) {
+    // --- EVALUATION PARAMETERS ---
+    let eval_steps = 10000;
+    let control_step: f64 = 0.01;
+    let timestep: f64 = model.opt().timestep;
+    let sim_steps = (control_step / timestep).round() as usize;
+
+    // --- 1. CALCULATE ANALYTICAL A AND B MATRICES ---
+    let mw: f64 = 0.032; // Total mass of both wheels (0.016 kg * 2)
+    let mp: f64 = 0.317; // Mass of pendulum (Base 0.316 + 2x shafts 0.0005)
+    let r: f64 = 0.040; // Wheel radius (80mm Pololu wheels)
+    let l: f64 = 0.023; // Distance to pendulum Center of Mass
+    let ip: f64 = 444.43e-6; // Pitch inertia of the pendulum body
+    let iw: f64 = 0.004027; // Effective inertia of wheels + geared motors
+    let g: f64 = 9.81; // Gravity
+
+    // E Matrix components
+    let e00 = iw + (r.powi(2)) * (mw + mp);
+    let e01 = mp * r * l;
+    let e10 = mp * r * l;
+    let e11 = ip + mp * (l.powi(2));
+
+    // Invert E manually for a 2x2
+    let det = e00 * e11 - e01 * e10;
+    let inv_det = 1.0 / det;
+    let e_inv_00 = e11 * inv_det;
+    let e_inv_01 = -e01 * inv_det;
+    let e_inv_10 = -e10 * inv_det;
+    let e_inv_11 = e00 * inv_det;
+
+    // G and F Vectors
+    let g_vec = [0.0, -mp * g * l];
+    let f_vec = [1.0, 0.0];
+
+    // Construct A matrix directly as an nalgebra SMatrix
+    let mut a_mat = SMatrix::<f64, DIM_X, DIM_X>::zeros();
+    a_mat[(0, 2)] = 1.0;
+    a_mat[(1, 3)] = 1.0;
+    a_mat[(2, 1)] = -(e_inv_00 * g_vec[0] + e_inv_01 * g_vec[1]);
+    a_mat[(3, 1)] = -(e_inv_10 * g_vec[0] + e_inv_11 * g_vec[1]);
+
+    // Construct B matrix directly as an nalgebra SMatrix
+    let mut b_mat = SMatrix::<f64, DIM_X, DIM_U>::zeros();
+    b_mat[(2, 0)] = e_inv_00 * f_vec[0] + e_inv_01 * f_vec[1];
+    b_mat[(3, 0)] = e_inv_10 * f_vec[0] + e_inv_11 * f_vec[1];
+
+    // --- 2. CALCULATE OPTIMAL LQR GAIN ---
+    let q_cost = SMatrix::<f64, DIM_X, DIM_X>::from_diagonal(&SVector::from([
+        10.0,  // phi penalty
+        100.0, // theta penalty
+        1.0,   // phi_dot penalty
+        10.0,  // theta_dot penalty
+    ]));
+    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([300.0]));
+
+    // Discretize A and B for the 100Hz controller
+    let a_d = SMatrix::<f64, DIM_X, DIM_X>::identity() + a_mat * control_step;
+    let b_d = b_mat * control_step;
+
+    // Iterative DARE Solver (Discrete Algebraic Riccati Equation)
+    let mut p_mat = q_cost;
+    for _ in 0..1000 {
+        let r_plus_bt_p_b = r_cost + b_d.transpose() * p_mat * b_d;
+        let inv_term = r_plus_bt_p_b
+            .try_inverse()
+            .expect("DARE: R matrix inversion failed");
+        let p_next = q_cost + a_d.transpose() * p_mat * a_d
+            - a_d.transpose() * p_mat * b_d * inv_term * b_d.transpose() * p_mat * a_d;
+
+        // Check for convergence
+        if (p_next - p_mat).norm() < 1e-7 {
+            p_mat = p_next;
+            break;
+        }
+        p_mat = p_next;
+    }
+
+    // Calculate final K gain: K = - (R + B^T P B)^-1 B^T P A  <-- SIGN FLIPPED HERE
+    let inv_term = (r_cost + b_d.transpose() * p_mat * b_d)
+        .try_inverse()
+        .unwrap();
+    let k_matrix = -(inv_term * b_d.transpose() * p_mat * a_d);
+
+    // Print the calculated optimal gains nicely
+    println!("\n============================================================");
+    println!("       ANALYTICAL LQR GAIN CALCULATION (100Hz)");
+    println!("============================================================");
+    println!("Optimal K Matrix (Control Law: u = Kx):");
+    println!("  K_phi       = {:>10.4}", k_matrix[(0, 0)]);
+    println!("  K_theta     = {:>10.4}", k_matrix[(0, 1)]);
+    println!("  K_phi_dot   = {:>10.4}", k_matrix[(0, 2)]);
+    println!("  K_theta_dot = {:>10.4}", k_matrix[(0, 3)]);
+    println!("============================================================\n");
+
+    // --- 3. RESET SIMULATION ---
+    data.reset();
+    data.qpos_mut()[2] = 0.05;
+    data.qpos_mut()[3] = 1.0;
+
+    let mut noises: Vec<SVector<f64, DIM_X>> = Vec::with_capacity(eval_steps);
+
+    // --- 4. RUN SIMULATION & COLLECT NOISE SAMPLES ---
+    for _ in 0..eval_steps {
+        // Extract State k into an SVector
+        let x_k_array = extract_state(data);
+        let x_k = SVector::<f64, DIM_X>::from_column_slice(&x_k_array);
+
+        // LQR Control Law (u = K * x) <-- SIGN FLIPPED HERE
+        let u_mat = k_matrix * x_k;
+        let u_raw = u_mat[(0, 0)];
+
+        let raw_tau = u_raw / 2.0;
+
+        // Motor Realism (Quantization & Limits)
+        let qvel = data.qvel();
+        let phi_dot_left = qvel[6];
+        let phi_dot_right = qvel[8];
+        let max_physical_torque = 0.1;
+        let pwm_resolution = 400.0;
+        let max_speed = 25.0;
+
+        let avail_l = max_physical_torque * (0.0f64.max(1.0 - (phi_dot_left.abs() / max_speed)));
+        let avail_r = max_physical_torque * (0.0f64.max(1.0 - (phi_dot_right.abs() / max_speed)));
+
+        let pwm_l_raw = (raw_tau / max_physical_torque) * pwm_resolution;
+        let pwm_r_raw = (raw_tau / max_physical_torque) * pwm_resolution;
+
+        let tau_l_final =
+            ((pwm_l_raw.round() / pwm_resolution) * max_physical_torque).clamp(-avail_l, avail_l);
+        let tau_r_final =
+            ((pwm_r_raw.round() / pwm_resolution) * max_physical_torque).clamp(-avail_r, avail_r);
+
+        data.ctrl_mut()[0] = tau_l_final;
+        data.ctrl_mut()[1] = tau_r_final;
+
+        let u_applied = tau_l_final + tau_r_final;
+
+        // Step Simulation
+        for _ in 0..sim_steps {
+            data.step();
+        }
+
+        // Extract State k+1
+        let x_k1_array = extract_state(data);
+        let x_k1 = SVector::<f64, DIM_X>::from_column_slice(&x_k1_array);
+
+        // --- 5. CALCULATE PROCESS NOISE ---
+        let x_dot_empirical = (x_k1 - x_k) / control_step;
+
+        // Theoretical derivative using analytical continuous matrices
+        // NOTE: We apply u_applied as an SVector to match nalgebra multiplication
+        let u_applied_vec = SVector::<f64, DIM_U>::from_column_slice(&[u_applied]);
+        let x_dot_theory = (a_mat * x_k) + (b_mat * u_applied_vec);
+
+        let n = x_dot_empirical - x_dot_theory;
+        noises.push(n);
+    }
+
+    // --- 6. COMPUTE EMPIRICAL MEAN & COVARIANCE ---
+    let mut mean = SVector::<f64, DIM_X>::zeros();
+    for n in &noises {
+        mean += n;
+    }
+    mean /= eval_steps as f64;
+
+    let mut covariance = SMatrix::<f64, DIM_X, DIM_X>::zeros();
+    for n in &noises {
+        let diff = n - mean;
+        covariance += diff * diff.transpose();
+    }
+    covariance /= (eval_steps - 1) as f64;
+
+    (mean, covariance)
+}
+
+// Helper function to extract state cleanly
+fn extract_state<'a>(data: &MjData<&'a MjModel>) -> [f64; 4] {
+    let qpos = data.qpos();
+    let qvel = data.qvel();
+
+    let qw = qpos[3];
+    let qy = qpos[5];
+    let theta = 2.0 * qy.atan2(qw);
+    let theta_dot = qvel[4];
+
+    let phi_left = qpos[7];
+    let phi_right = qpos[9];
+    let phi = (phi_left + phi_right) / 2.0;
+
+    let phi_dot_left = qvel[6];
+    let phi_dot_right = qvel[8];
+    let phi_dot = (phi_dot_left + phi_dot_right) / 2.0;
+
+    [phi, theta, phi_dot, theta_dot]
 }

@@ -1,6 +1,5 @@
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
-
-pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.182574, 4.412952, 0.098523, 0.441536];
+pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.1479, 5.5863, 0.0896, 0.5585];
 
 pub const DT: f64 = 0.01;
 
@@ -14,7 +13,6 @@ const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 const GAMMA: f64 = 0.99; // Discount factor
 pub const SAMPLES_PER_ITER: usize = 100000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
-const ETA: f64 = 0.0f64;
 
 pub fn spectral_radius(
     a_mat: &SMatrix<f64, DIM_X, DIM_X>,
@@ -82,7 +80,11 @@ fn compute_k_from_h(h_mat: &SMatrix<f64, DIM_X_AND_U, DIM_X_AND_U>) -> SMatrix<f
     }
 }
 
-fn run_lstdq(batch: Vec<StateAction>, k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f64, DIM_PARAMS> {
+fn run_lstdq(
+    batch: Vec<StateAction>,
+    k: &SMatrix<f64, DIM_U, DIM_X>,
+    covariance: &SMatrix<f64, DIM_X, DIM_X>,
+) -> SVector<f64, DIM_PARAMS> {
     let mut a_mat = DMatrix::<f64>::zeros(DIM_PARAMS, DIM_PARAMS);
     let mut b_vec = DVector::<f64>::zeros(DIM_PARAMS);
 
@@ -94,29 +96,34 @@ fn run_lstdq(batch: Vec<StateAction>, k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector
     ]));
     let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([300.0]));
 
-    // Construct matrix M = [I; K]
+    // Construct matrix M = [I; Keval]
     let mut m_mat = SMatrix::<f64, DIM_X_AND_U, DIM_X>::zeros();
     m_mat
         .fixed_view_mut::<DIM_X, DIM_X>(0, 0)
         .copy_from(&SMatrix::<f64, DIM_X, DIM_X>::identity());
     m_mat.fixed_view_mut::<DIM_U, DIM_X>(DIM_X, 0).copy_from(k);
 
-    // Compute the outer product: P = M * M^T
-    let p_mat = m_mat * m_mat.transpose();
+    // Compute the outer product with process noise covariance: P = M * Sigma * M^T
+    let p_mat = m_mat * covariance * m_mat.transpose();
 
-    // Vectorize P to get the bias vector: bias = eta * svec(P)
-    let mut bias_vec = SVector::<f64, DIM_PARAMS>::zeros();
+    // Vectorize P to get the bias vector 'f' = svec(P)
+    let mut f_vec = SVector::<f64, DIM_PARAMS>::zeros();
     let mut idx = 0;
     for i in 0..DIM_X_AND_U {
         for j in i..DIM_X_AND_U {
             let val = p_mat[(i, j)];
-            bias_vec[idx] = val * ETA;
+            // Proper svec() requires scaling off-diagonals by sqrt(2)
+            // Make sure your get_quadratic_features() also uses sqrt(2) for off-diagonals!
+            f_vec[idx] = if i == j {
+                val
+            } else {
+                val * std::f64::consts::SQRT_2
+            };
             idx += 1;
         }
     }
 
     // 2. Iterate directly over the raw chronological batch
-    // We stop at batch.len() - 1 because we need a "next" state for every "current" state
     for i in 0..(batch.len() - 1) {
         let current = &batch[i];
         let next = &batch[i + 1];
@@ -137,21 +144,21 @@ fn run_lstdq(batch: Vec<StateAction>, k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector
             next.theta_dot,
         ]);
 
-        // Cost calculation using our local Q and R
+        // ct := xt^T S xt + ut^T R ut
         let cost = x.dot(&(q_cost * x)) + u.dot(&(r_cost * u));
 
-        // Feature computation with BIAS using the NOISY action applied
-        let phi = get_quadratic_features(&x, &u) + bias_vec;
+        // phi_t := phi(xt, ut)
+        let phi_t = get_quadratic_features(&x, &u);
 
-        // Target policy uses the current gain matrix K (Greedy action)
+        // psi_{t+1} := phi(x_{next}, Keval * x_{next})
         let u_next_greedy = k * x_next;
-        let phi_next = get_quadratic_features(&x_next, &u_next_greedy) + bias_vec;
+        let psi_t_plus_1 = get_quadratic_features(&x_next, &u_next_greedy);
 
-        // LSTDQ Update
-        let temporal_diff = phi - (GAMMA * phi_next);
+        // LSTDQ Update mapping to: phi_t * (phi_t - psi_{t+1} + f)^T
+        let temporal_diff = phi_t - (GAMMA * psi_t_plus_1) + f_vec;
 
         for r in 0..DIM_PARAMS {
-            let phi_r = phi[r];
+            let phi_r = phi_t[r];
             b_vec[r] += phi_r * cost;
             for c in 0..DIM_PARAMS {
                 a_mat[(r, c)] += phi_r * temporal_diff[c];
@@ -164,23 +171,24 @@ fn run_lstdq(batch: Vec<StateAction>, k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector
         a_mat[(i, i)] += LAMBDA_REG;
     }
 
-    // Solve for theta
-    let theta_dyn = a_mat
+    // Solve for q-function parameters
+    let q_dyn = a_mat
         .lu()
         .solve(&b_vec)
         .unwrap_or(DVector::zeros(DIM_PARAMS));
 
-    let mut theta = SVector::<f64, DIM_PARAMS>::zeros();
-    theta.copy_from_slice(theta_dyn.as_slice());
+    let mut q_params = SVector::<f64, DIM_PARAMS>::zeros();
+    q_params.copy_from_slice(q_dyn.as_slice());
 
-    theta
-} // --- Helpers ---
-  //
+    q_params
+}
+
 pub fn calculate_k(
     batch: Vec<StateAction>,
     current_k: &SMatrix<f64, DIM_U, DIM_X>,
+    covariance: &SMatrix<f64, DIM_X, DIM_X>,
 ) -> SMatrix<f64, DIM_U, DIM_X> {
-    let theta = run_lstdq(batch, current_k);
+    let theta = run_lstdq(batch, current_k, covariance);
     let h_mat = theta_to_h(&theta);
     compute_k_from_h(&h_mat)
 }
