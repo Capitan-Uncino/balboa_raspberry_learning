@@ -20,7 +20,9 @@
         glfw
         wayland
         libxkbcommon
-        libdecor
+        libdecor 
+
+        fontconfig
         
         # X11 dependencies
         libx11
