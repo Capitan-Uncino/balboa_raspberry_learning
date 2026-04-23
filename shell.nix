@@ -3,6 +3,7 @@
 pkgs.mkShell {
   # nativeBuildInputs: Tools needed at compile-time
   nativeBuildInputs = with pkgs; [
+    mujoco
     pkg-config
     # Add these to override your broken global rustup
     rustc
@@ -14,7 +15,6 @@ pkgs.mkShell {
 
   # buildInputs: Libraries needed at compile-time and run-time
   buildInputs = with pkgs; [
-    mujoco
     udev
     
     # Graphical libraries (Required by egui 0.33)

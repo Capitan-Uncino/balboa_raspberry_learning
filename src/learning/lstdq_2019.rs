@@ -4,16 +4,19 @@ pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.1479, 5.5863, 0.0896, 0.5585];
 pub const DT: f64 = 0.01;
 
 // --- System Dimensions ---
-pub const DIM_X: usize = 4; // [theta, theta_dot]
-pub const DIM_U: usize = 1; // [torque]
+pub const DIM_X: usize = 4;
+pub const DIM_U: usize = 1;
 const DIM_X_AND_U: usize = DIM_X + DIM_U;
 const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 
 // --- LSPI Hyperparameters ---
-const GAMMA: f64 = 0.99; // Discount factor
+const GAMMA: f64 = 1.00; // Discount factor 0.99
 pub const SAMPLES_PER_ITER: usize = 100000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
 
+const BIAS_COMPENSATION: bool = true;
+//
+//
 pub fn spectral_radius(
     a_mat: &SMatrix<f64, DIM_X, DIM_X>,
     b_mat: &SMatrix<f64, DIM_X, DIM_U>,
@@ -123,19 +126,21 @@ fn run_lstdq(
         }
     }
 
+    let mut skipped_couples = 0;
+    let state_jump_threshold = 2.0;
+
     // 2. Iterate directly over the raw chronological batch
     for i in 0..(batch.len() - 1) {
         let current = &batch[i];
         let next = &batch[i + 1];
 
-        // Construct mathematical vectors directly from the I2C structs
+        // Construct mathematical vectors directly from the I2C structs FIRST
         let x = SVector::<f64, DIM_X>::from_column_slice(&[
             current.phi,
             current.theta,
             current.phi_dot,
             current.theta_dot,
         ]);
-        let u = SVector::<f64, DIM_U>::from_column_slice(&[current.u]);
 
         let x_next = SVector::<f64, DIM_X>::from_column_slice(&[
             next.phi,
@@ -143,6 +148,16 @@ fn run_lstdq(
             next.phi_dot,
             next.theta_dot,
         ]);
+
+        // --- NEW: Discontinuity check ---
+        // If the state changes too drastically in one timestep, it implies a reset/fall.
+        let state_diff_norm = (x - x_next).norm();
+        if state_diff_norm > state_jump_threshold {
+            skipped_couples += 1;
+            continue; // Skip this transition entirely
+        }
+
+        let u = SVector::<f64, DIM_U>::from_column_slice(&[current.u]);
 
         // ct := xt^T S xt + ut^T R ut
         let cost = x.dot(&(q_cost * x)) + u.dot(&(r_cost * u));
@@ -155,7 +170,12 @@ fn run_lstdq(
         let psi_t_plus_1 = get_quadratic_features(&x_next, &u_next_greedy);
 
         // LSTDQ Update mapping to: phi_t * (phi_t - psi_{t+1} + f)^T
-        let temporal_diff = phi_t - (GAMMA * psi_t_plus_1) + f_vec;
+        //
+        let temporal_diff = if BIAS_COMPENSATION {
+            phi_t - (GAMMA * psi_t_plus_1) + f_vec
+        } else {
+            phi_t - (GAMMA * psi_t_plus_1)
+        };
 
         for r in 0..DIM_PARAMS {
             let phi_r = phi_t[r];
@@ -165,6 +185,13 @@ fn run_lstdq(
             }
         }
     }
+
+    // --- NEW: Print the results ---
+    let total_couples = batch.len().saturating_sub(1);
+    println!(
+        "LSTDQ Batch Processing: Skipped {} / {} transitions due to discontinuity.",
+        skipped_couples, total_couples
+    );
 
     // Apply L2 Regularization
     for i in 0..DIM_PARAMS {

@@ -13,7 +13,7 @@ const ONLINE: bool = true;
 const NEW_BATCH: bool = false;
 const SIM: bool = true;
 const VISUALIZE: bool = false;
-const PLOT: bool = false;
+const PLOT: bool = true;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("========================================");
@@ -23,7 +23,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if ONLINE {
         if SIM {
-            run_online_mode_sim(VISUALIZE)?;
+            if PLOT {
+                run_sim_plot(VISUALIZE)?;
+            } else {
+                run_online_mode_sim(VISUALIZE)?;
+            }
         } else {
             run_online_mode()?;
         }
@@ -33,8 +37,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             run_data_collection_mode()?;
         }
-    } else if PLOT {
-        run_sim_plot(VISUALIZE)?
     } else {
         run_offline_computation_mode()?;
     }

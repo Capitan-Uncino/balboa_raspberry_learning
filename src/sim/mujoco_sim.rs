@@ -8,6 +8,7 @@ use mujoco_rs::viewer::MjViewer;
 use nalgebra::{SMatrix, SVector};
 use rand::rng;
 use rand::RngExt;
+use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 use std::f64::consts::PI;
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,8 @@ use std::time::{Duration, Instant};
 
 const THETA_OU: f64 = 0.30;
 const SIGMA_OU: f64 = 0.10;
+const SEED: u64 = 42;
+const BACKLASH_JOINTS: bool = false;
 
 fn collect_full_batch_sim<'a>(
     model: &'a MjModel,
@@ -40,18 +43,14 @@ fn collect_full_batch_sim<'a>(
     let timestep = model.opt().timestep;
     let sim_steps = (control_step / timestep).round() as usize;
 
-    // --- OU NOISE PARAMETERS ---
     let mut last_noise: f64 = 0.0;
     let mut rng = rng();
 
-    // Calculate how much real time should pass per control step
     let target_duration = Duration::from_secs_f64(control_step);
 
     println!(">>> [SIM] Running MuJoCo Simulation Loop...");
 
-    // Only check if the viewer is running if rendering is actually enabled
     while state_batch.len() < SAMPLES_PER_ITER && (!enable_rendering || viewer.running()) {
-        // Start the timer for real-time pacing
         let step_start = Instant::now();
 
         if let Some(new_gains) = pending_gains.lock().unwrap().take() {
@@ -59,26 +58,12 @@ fn collect_full_batch_sim<'a>(
             *active_gains = new_gains;
         }
 
-        let qpos = data.qpos();
-        let qvel = data.qvel();
+        // --- EXTRACT RAW STATE VIA HELPER ---
+        let (phi_left, phi_right, theta, phi_dot_left, phi_dot_right, theta_dot) =
+            extract_state(data, BACKLASH_JOINTS);
 
-        // --- 1. Pitch (Theta) Extraction ---
-        // Using atan2 is much more stable than asin for balancing robots.
-        // It handles the full 360-degree range and avoids NaN errors.
-        let qw = qpos[3];
-        let qy = qpos[5];
-        let theta = 2.0 * qy.atan2(qw);
-        let theta_dot = qvel[4]; // Pitch velocity (Y-axis angular velocity)
-
-        // --- 2. Wheel Position (Phi) Extraction ---
-        // Use the motor joints (7 and 9), not the backlash joints.
-        let phi_left = qpos[7];
-        let phi_right = qpos[9]; // Fixed index
+        // --- TRANSFORM INTO LQR STATE ---
         let phi = (phi_left + phi_right) / 2.0;
-
-        // --- 3. Wheel Velocity (Phi_dot) Extraction ---
-        let phi_dot_left = qvel[6];
-        let phi_dot_right = qvel[8]; // Fixed index
         let phi_dot = (phi_dot_left + phi_dot_right) / 2.0;
 
         let k1 = active_gains[0];
@@ -86,8 +71,6 @@ fn collect_full_batch_sim<'a>(
         let k3 = active_gains[2];
         let k4 = active_gains[3];
 
-        // 1. LQR Control Law: u = -Kx
-        // (Note the negative sign at the front!)
         let u_raw = k1 * phi + k2 * theta + k3 * phi_dot + k4 * theta_dot;
 
         // ==========================================
@@ -99,14 +82,10 @@ fn collect_full_batch_sim<'a>(
         let dx = THETA_OU * (-last_noise) * 0.01 + SIGMA_OU * epsilon * 0.1;
         last_noise += dx;
 
-        // --- Constants (adjust based on your setup) ---
         let max_physical_torque = 0.1;
-        let pwm_resolution = 400.0; // The Balboa 32U4 uses 400 for max speed
+        let pwm_resolution = 400.0;
 
-        // 2. Add noise
         let tau_total = u_raw + last_noise;
-
-        // 3. Split load
         let raw_tau = tau_total / 2.0;
 
         let raw_tau_offset = if phi_dot > 0.0f64 {
@@ -115,29 +94,23 @@ fn collect_full_batch_sim<'a>(
             raw_tau - 0.00
         };
 
-        // 4. Back-EMF constraints (as before)
+        // Back-EMF constraints using raw velocities
         let max_speed = 25.0;
         let avail_l = max_physical_torque * (0.0f64.max(1.0 - (phi_dot_left.abs() / max_speed)));
         let avail_r = max_physical_torque * (0.0f64.max(1.0 - (phi_dot_right.abs() / max_speed)));
 
-        // 5. Quantization Step (Simulating the 8-bit/10-bit PWM resolution)
-        // First, normalize the requested torque to a -400 to 400 scale
         let pwm_l_raw = (raw_tau_offset / max_physical_torque) * pwm_resolution;
         let pwm_r_raw = (raw_tau_offset / max_physical_torque) * pwm_resolution;
 
-        // Round to the nearest integer step (the actual "quantization")
         let pwm_l_quantized = pwm_l_raw.round();
         let pwm_r_quantized = pwm_r_raw.round();
 
-        // Convert back to physical Torque (Nm) for MuJoCo
         let tau_l_quantized = (pwm_l_quantized / pwm_resolution) * max_physical_torque;
         let tau_r_quantized = (pwm_r_quantized / pwm_resolution) * max_physical_torque;
 
-        // 6. Final Clamp (Apply the dynamic Back-EMF limits)
         let tau_l_final = tau_l_quantized.clamp(-avail_l, avail_l);
         let tau_r_final = tau_r_quantized.clamp(-avail_r, avail_r);
 
-        // 7. Apply to actuators
         data.ctrl_mut()[0] = tau_l_final;
         data.ctrl_mut()[1] = tau_r_final;
 
@@ -194,13 +167,10 @@ fn collect_full_batch_sim<'a>(
                 );
                 *was_balancing = false;
 
-                // Safe Reset (Quaternion reconstruction is still required)
                 data.reset();
                 data.qpos_mut()[2] = 0.05;
-                data.qpos_mut()[3] = 1.0; // W must be 1.0!
-                                          // We don't need to manually tilt it anymore; the OU noise will do it!
+                data.qpos_mut()[3] = 1.0;
 
-                // Reset the noise history so it doesn't jump aggressively on respawn
                 last_noise = 0.0;
             }
         }
@@ -393,6 +363,33 @@ pub fn run_sim_plot(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     let noise = estimate_process_noise(&model, &mut data);
 
+    println!("============================================================");
+    println!("       PROCESS NOISE DIAGNOSTIC REPORT");
+    println!("============================================================");
+
+    // 1. Print the Mean Vector (The "Bias")
+    println!("MEAN VECTOR (Systematic Bias / Residuals):");
+    println!("  [ φ_dot,     θ_dot,     φ_ddot,    θ_ddot ]");
+    println!(
+        "  [{:+.4e}, {:+.4e}, {:+.4e}, {:+.4e}]",
+        noise.0[0], noise.0[1], noise.0[2], noise.0[3]
+    );
+
+    // 2. Print the Covariance Matrix (The "Variance")
+    println!("\nCOVARIANCE MATRIX (Sigma):");
+    println!("            φ_dot           θ_dot           φ_ddot          θ_ddot");
+    let labels = ["φ_dot ", "θ_dot ", "φ_ddot", "θ_ddot"];
+    for i in 0..4 {
+        print!("{} ", labels[i]);
+        for j in 0..4 {
+            // Alignment is key here to see the diagonal vs off-diagonal
+            print!("{:>15.4e} ", noise.1[(i, j)]);
+        }
+        println!();
+    }
+
+    println!("============================================================");
+
     // --- 1. Evaluate the Original Baseline Policy ---
     println!("Evaluating original baseline policy...");
     let baseline_cost = evaluate_policy_sim(&model, &mut data, initial_k_array, false);
@@ -492,7 +489,7 @@ fn evaluate_policy_sim<'a>(
     enable_noise: bool,
 ) -> f64 {
     // --- EVALUATION PARAMETERS ---
-    let eval_steps = 1000; // 10 seconds of simulation at 100Hz
+    let eval_steps = 10000; // 10 seconds of simulation at 100Hz
     let control_step: f64 = 0.01;
     let timestep: f64 = model.opt().timestep;
     let sim_steps = (control_step / timestep).round() as usize;
@@ -507,41 +504,41 @@ fn evaluate_policy_sim<'a>(
     // R = [[300.0]]
     let r_tau = 300.0;
 
+    // --- RNG INITIALIZATION ---
+    // Seed the RNG using the globally defined constant SEED (e.g., const SEED: u64 = 42;)
+    let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+
     // --- RESET SIMULATION ---
-    // Start from a clean, upright state for a fair evaluation of the policy
     data.reset();
     data.qpos_mut()[2] = 0.05; // Starting elevation
-    data.qpos_mut()[3] = 1.0; // W component of quaternion must be 1.0
+
+    // 1. Randomize initial pitch (Theta) between +/- 10 degrees (~0.1745 rad)
+    let initial_theta: f64 = rng.random_range(-0.1745..0.1745);
+
+    // 2. Convert to valid Quaternion for Y-axis rotation
+    data.qpos_mut()[3] = (initial_theta / 2.0).cos(); // w
+    data.qpos_mut()[4] = 0.0; // x
+    data.qpos_mut()[5] = (initial_theta / 2.0).sin(); // y
+    data.qpos_mut()[6] = 0.0; // z
+
+    // 3. Randomize initial pitch velocity (Theta_dot)
+    let initial_theta_dot: f64 = rng.random_range(-0.1..0.1);
+    data.qvel_mut()[4] = initial_theta_dot;
 
     let mut total_cost = 0.0;
 
     // OU Noise setup
     let mut last_noise: f64 = 0.0;
-    let mut rng = rng();
 
     for step in 0..eval_steps {
-        // --- 1. EXTRACT STATE ---
-        let qpos = data.qpos();
-        let qvel = data.qvel();
+        // --- 1. EXTRACT RAW STATE VIA HELPER ---
+        let (phi_left, phi_right, theta, phi_dot_left, phi_dot_right, theta_dot) =
+            extract_state(data, BACKLASH_JOINTS);
 
-        // --- 1. Pitch (Theta) Extraction ---
-        // Using atan2 is much more stable than asin for balancing robots.
-        // It handles the full 360-degree range and avoids NaN errors.
-        let qw = qpos[3];
-        let qy = qpos[5];
-        let theta = 2.0 * qy.atan2(qw);
-        let theta_dot = qvel[4]; // Pitch velocity (Y-axis angular velocity)
-
-        // --- 2. Wheel Position (Phi) Extraction ---
-        // Use the motor joints (7 and 9), not the backlash joints.
-        let phi_left = qpos[7];
-        let phi_right = qpos[9]; // Fixed index
+        // --- TRANSFORM INTO LQR STATE ---
         let phi = (phi_left + phi_right) / 2.0;
-
-        // --- 3. Wheel Velocity (Phi_dot) Extraction ---
-        let phi_dot_left = qvel[6];
-        let phi_dot_right = qvel[8]; // Fixed index
         let phi_dot = (phi_dot_left + phi_dot_right) / 2.0;
+
         // --- 2. STABILITY CHECK ---
         let is_sane = theta.is_finite() && theta_dot.abs() < 100.0;
         let is_upright = theta.abs() < stop_angle_rad;
@@ -564,6 +561,7 @@ fn evaluate_policy_sim<'a>(
 
         // --- 4. OPTIONAL NOISE ---
         if enable_noise {
+            // Use the seeded RNG for deterministic noise generation across runs
             let u1: f64 = rng.random_range(0.0001..1.0);
             let u2: f64 = rng.random_range(0.0..1.0);
             let epsilon = (-2.0f64 * u1.ln()).sqrt() * (2.0f64 * PI * u2).cos();
@@ -648,13 +646,13 @@ pub fn estimate_process_noise<'a>(
     let sim_steps = (control_step / timestep).round() as usize;
 
     // --- 1. CALCULATE ANALYTICAL A AND B MATRICES ---
-    let mw: f64 = 0.032; // Total mass of both wheels (0.016 kg * 2)
-    let mp: f64 = 0.317; // Mass of pendulum (Base 0.316 + 2x shafts 0.0005)
-    let r: f64 = 0.040; // Wheel radius (80mm Pololu wheels)
-    let l: f64 = 0.023; // Distance to pendulum Center of Mass
-    let ip: f64 = 444.43e-6; // Pitch inertia of the pendulum body
-    let iw: f64 = 0.004027; // Effective inertia of wheels + geared motors
-    let g: f64 = 9.81; // Gravity
+    let mw: f64 = 0.032;
+    let mp: f64 = 0.317;
+    let r: f64 = 0.040;
+    let l: f64 = 0.023;
+    let ip: f64 = 444.43e-6;
+    let iw: f64 = 0.004027;
+    let g: f64 = 9.81;
 
     // E Matrix components
     let e00 = iw + (r.powi(2)) * (mw + mp);
@@ -717,15 +715,14 @@ pub fn estimate_process_noise<'a>(
         p_mat = p_next;
     }
 
-    // Calculate final K gain: K = - (R + B^T P B)^-1 B^T P A  <-- SIGN FLIPPED HERE
+    // Calculate final K gain
     let inv_term = (r_cost + b_d.transpose() * p_mat * b_d)
         .try_inverse()
         .unwrap();
     let k_matrix = -(inv_term * b_d.transpose() * p_mat * a_d);
 
-    // Print the calculated optimal gains nicely
     println!("\n============================================================");
-    println!("       ANALYTICAL LQR GAIN CALCULATION (100Hz)");
+    println!("        ANALYTICAL LQR GAIN CALCULATION (100Hz)");
     println!("============================================================");
     println!("Optimal K Matrix (Control Law: u = Kx):");
     println!("  K_phi       = {:>10.4}", k_matrix[(0, 0)]);
@@ -734,29 +731,41 @@ pub fn estimate_process_noise<'a>(
     println!("  K_theta_dot = {:>10.4}", k_matrix[(0, 3)]);
     println!("============================================================\n");
 
-    // --- 3. RESET SIMULATION ---
+    // --- 3. RESET SIMULATION & INJECT SEEDED RANDOM STATE ---
+    let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+
     data.reset();
     data.qpos_mut()[2] = 0.05;
-    data.qpos_mut()[3] = 1.0;
+
+    let initial_theta: f64 = rng.random_range(-0.1745..0.1745);
+    data.qpos_mut()[3] = (initial_theta / 2.0).cos();
+    data.qpos_mut()[4] = 0.0;
+    data.qpos_mut()[5] = (initial_theta / 2.0).sin();
+    data.qpos_mut()[6] = 0.0;
+
+    let initial_theta_dot: f64 = rng.random_range(-0.1..0.1);
+    data.qvel_mut()[4] = initial_theta_dot;
 
     let mut noises: Vec<SVector<f64, DIM_X>> = Vec::with_capacity(eval_steps);
 
     // --- 4. RUN SIMULATION & COLLECT NOISE SAMPLES ---
     for _ in 0..eval_steps {
-        // Extract State k into an SVector
-        let x_k_array = extract_state(data);
-        let x_k = SVector::<f64, DIM_X>::from_column_slice(&x_k_array);
+        // Extract raw states via helper
+        let (phi_left, phi_right, theta, phi_dot_left, phi_dot_right, theta_dot) =
+            extract_state(data, BACKLASH_JOINTS);
 
-        // LQR Control Law (u = K * x) <-- SIGN FLIPPED HERE
+        // Transform into LQR representation
+        let phi = (phi_left + phi_right) / 2.0;
+        let phi_dot = (phi_dot_left + phi_dot_right) / 2.0;
+        let x_k = SVector::<f64, DIM_X>::from_column_slice(&[phi, theta, phi_dot, theta_dot]);
+
+        // LQR Control Law (u = K * x)
         let u_mat = k_matrix * x_k;
         let u_raw = u_mat[(0, 0)];
 
         let raw_tau = u_raw / 2.0;
 
         // Motor Realism (Quantization & Limits)
-        let qvel = data.qvel();
-        let phi_dot_left = qvel[6];
-        let phi_dot_right = qvel[8];
         let max_physical_torque = 0.1;
         let pwm_resolution = 400.0;
         let max_speed = 25.0;
@@ -782,15 +791,17 @@ pub fn estimate_process_noise<'a>(
             data.step();
         }
 
-        // Extract State k+1
-        let x_k1_array = extract_state(data);
-        let x_k1 = SVector::<f64, DIM_X>::from_column_slice(&x_k1_array);
+        // Extract State k+1 via helper & Transform
+        let (phi_left, phi_right, theta, phi_dot_left, phi_dot_right, theta_dot) =
+            extract_state(data, BACKLASH_JOINTS);
+
+        let phi = (phi_left + phi_right) / 2.0;
+        let phi_dot = (phi_dot_left + phi_dot_right) / 2.0;
+        let x_k1 = SVector::<f64, DIM_X>::from_column_slice(&[phi, theta, phi_dot, theta_dot]);
 
         // --- 5. CALCULATE PROCESS NOISE ---
         let x_dot_empirical = (x_k1 - x_k) / control_step;
 
-        // Theoretical derivative using analytical continuous matrices
-        // NOTE: We apply u_applied as an SVector to match nalgebra multiplication
         let u_applied_vec = SVector::<f64, DIM_U>::from_column_slice(&[u_applied]);
         let x_dot_theory = (a_mat * x_k) + (b_mat * u_applied_vec);
 
@@ -815,23 +826,37 @@ pub fn estimate_process_noise<'a>(
     (mean, covariance)
 }
 
-// Helper function to extract state cleanly
-fn extract_state<'a>(data: &MjData<&'a MjModel>) -> [f64; 4] {
+// Helper function to extract raw state cleanly, supporting both XML models
+fn extract_state<'a>(
+    data: &MjData<&'a MjModel>,
+    has_backlash: bool,
+) -> (f64, f64, f64, f64, f64, f64) {
     let qpos = data.qpos();
     let qvel = data.qvel();
 
+    // --- 1. Pitch (Theta) Extraction ---
     let qw = qpos[3];
     let qy = qpos[5];
     let theta = 2.0 * qy.atan2(qw);
     let theta_dot = qvel[4];
 
+    // --- INDEX ROUTING ---
+    let right_qpos_idx = if has_backlash { 9 } else { 8 };
+    let right_qvel_idx = if has_backlash { 8 } else { 7 };
+
+    // --- 2. Wheel Position & Velocity Extraction ---
     let phi_left = qpos[7];
-    let phi_right = qpos[9];
-    let phi = (phi_left + phi_right) / 2.0;
+    let phi_right = qpos[right_qpos_idx];
 
     let phi_dot_left = qvel[6];
-    let phi_dot_right = qvel[8];
-    let phi_dot = (phi_dot_left + phi_dot_right) / 2.0;
+    let phi_dot_right = qvel[right_qvel_idx];
 
-    [phi, theta, phi_dot, theta_dot]
+    (
+        phi_left,
+        phi_right,
+        theta,
+        phi_dot_left,
+        phi_dot_right,
+        theta_dot,
+    )
 }
