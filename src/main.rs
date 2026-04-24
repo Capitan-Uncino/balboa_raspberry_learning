@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if ONLINE {
         if SIM {
             if PLOT {
-                run_sim_plot(VISUALIZE)?;
+                run_sim_plot(VISUALIZE, 30.0, 10, 5, 0.5)?;
             } else {
                 run_online_mode_sim(VISUALIZE)?;
             }

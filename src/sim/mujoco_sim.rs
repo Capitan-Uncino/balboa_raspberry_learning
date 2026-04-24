@@ -9,7 +9,7 @@ use nalgebra::{SMatrix, SVector};
 use rand::rng;
 use rand::RngExt;
 use rand::SeedableRng;
-use rand_distr::{Distribution, Normal};
+use rand_distr::{Distribution, Normal, Uniform};
 use std::f64::consts::PI;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -349,11 +349,13 @@ pub fn run_data_collection_mode_sim(visualize: bool) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-pub fn run_sim_plot(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let n_policies = 2;
-    let n_updates = 3;
-    let policy_variance: f64 = 0.01; // Variance for the Gaussian noise
-
+pub fn run_sim_plot(
+    visualize: bool,
+    evaluation_threshold: f64,
+    n_policies: usize,
+    n_updates: usize,
+    uniform_half_interval: f64, // <-- Updated parameter
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading MuJoCo model 'balboa.xml'...");
     let model = MjModel::from_xml("balboa.xml").expect("Failed to load balboa.xml");
     let mut data = model.make_data();
@@ -364,7 +366,7 @@ pub fn run_sim_plot(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
     let noise = estimate_process_noise(&model, &mut data);
 
     println!("============================================================");
-    println!("       PROCESS NOISE DIAGNOSTIC REPORT");
+    println!("        PROCESS NOISE DIAGNOSTIC REPORT");
     println!("============================================================");
 
     // 1. Print the Mean Vector (The "Bias")
@@ -395,19 +397,26 @@ pub fn run_sim_plot(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
     let baseline_cost = evaluate_policy_sim(&model, &mut data, initial_k_array, false);
     println!("Baseline Cost: {:.4}", baseline_cost);
 
-    // --- 2. Generate N Policies via Gaussian Perturbation ---
+    // --- 2. Generate N Policies via Uniform Perturbation ---
     let mut rng = rng();
-    // Normal takes (mean, standard_deviation). std_dev is sqrt(variance).
-    let normal_dist = Normal::new(1.0f64, policy_variance.sqrt()).unwrap();
 
-    let mut policies: Vec<[f64; 4]> = (0..n_policies)
-        .map(|_| {
-            [
-                initial_k_array[0] * normal_dist.sample(&mut rng),
-                initial_k_array[1] * normal_dist.sample(&mut rng),
-                initial_k_array[2] * normal_dist.sample(&mut rng),
-                initial_k_array[3] * normal_dist.sample(&mut rng),
-            ]
+    // [NEW] Uniform distribution centered at 1.0, bounded by the half interval
+    let uniform_dist = Uniform::new_inclusive(
+        1.0f64 - uniform_half_interval,
+        1.0f64 + uniform_half_interval,
+    )?;
+
+    // We store policies alongside their original index: (p_idx, policy_array)
+    // This way, if we drop one, we don't lose track of which history array it belongs to.
+    let mut active_policies: Vec<(usize, [f64; 4])> = (0..n_policies)
+        .map(|id| {
+            let p = [
+                initial_k_array[0] * uniform_dist.sample(&mut rng),
+                initial_k_array[1] * uniform_dist.sample(&mut rng),
+                initial_k_array[2] * uniform_dist.sample(&mut rng),
+                initial_k_array[3] * uniform_dist.sample(&mut rng),
+            ];
+            (id, p)
         })
         .collect();
 
@@ -421,14 +430,26 @@ pub fn run_sim_plot(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("\r");
         println!("--- Update Step {} / {} ---", update_idx + 1, n_updates);
 
-        for (p_idx, policy) in policies.iter_mut().enumerate() {
+        // We'll collect the policies that pass the threshold into a new vector
+        let mut next_active_policies = Vec::new();
+
+        for (p_idx, mut policy) in active_policies {
             // A) EVALUATION PHASE (Noise OFF)
-            let empirical_cost = evaluate_policy_sim(&model, &mut data, *policy, false);
+            let empirical_cost = evaluate_policy_sim(&model, &mut data, policy, false);
             cost_history[p_idx].push(empirical_cost);
             println!("  Policy {} - Eval Cost: {:.4}", p_idx, empirical_cost);
 
+            // [NEW] Threshold Check
+            if empirical_cost > evaluation_threshold {
+                println!(
+                    "  [!] Policy {} exceeded threshold ({:.4} > {:.4}). Discarding from training.",
+                    p_idx, empirical_cost, evaluation_threshold
+                );
+                continue; // Skips batch collection & update, essentially dropping it
+            }
+
             // B) BATCH COLLECTION PHASE (Noise ON)
-            let mut active_gains = *policy;
+            let mut active_gains = policy;
             // We still use Arc/Mutex here to satisfy your existing function signature,
             // though the background thread is no longer strictly necessary in this sequential flow.
             let pending_gains: Arc<Mutex<Option<[f64; 4]>>> = Arc::new(Mutex::new(None));
@@ -449,35 +470,81 @@ pub fn run_sim_plot(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
 
             if batch_to_process.is_empty() {
                 println!("  [!] Batch empty, user likely exited early.");
+                // We keep it in the active list just in case, or you can choose to `continue` and drop it
+                next_active_policies.push((p_idx, policy));
                 continue;
             }
 
             // C) UPDATE PHASE (Synchronous)
             // Because we need the new K for the *next* update_idx, we compute it synchronously
             // instead of spawning a disconnected thread.
-            let current_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(policy);
+            let current_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&policy);
             let new_k_mat = calculate_k(batch_to_process, &current_k_mat, &noise.1);
 
             // Overwrite the current policy with the newly computed LSTDQ gains
-            *policy = [
+            policy = [
                 new_k_mat[(0, 0)],
                 new_k_mat[(0, 1)],
                 new_k_mat[(0, 2)],
                 new_k_mat[(0, 3)],
             ];
+
+            // Retain this policy for the next update step
+            next_active_policies.push((p_idx, policy));
+        }
+
+        // Update the active list for the next iteration
+        active_policies = next_active_policies;
+
+        // Early exit if all policies diverge/fail
+        if active_policies.is_empty() {
+            println!("All policies have been discarded. Terminating training loop early.");
+            break;
         }
     }
 
     // --- 4. Final Evaluation ---
     // Evaluate one last time to capture the cost *after* the final update
-    for (p_idx, policy) in policies.iter().enumerate() {
+    // Only runs for policies that survived until the end
+    for (p_idx, policy) in active_policies.iter() {
         let final_cost = evaluate_policy_sim(&model, &mut data, *policy, false);
-        cost_history[p_idx].push(final_cost);
+        cost_history[*p_idx].push(final_cost);
     }
+
+    // --- 4.5 Print Surviving Policies Table ---
+    println!("\n=================================================================================================");
+    println!("                                 FINAL SURVIVING POLICIES REPORT                                 ");
+    println!("=================================================================================================");
+    println!("| Policy ID | Final Cost |   K1 (φ_dot)    |   K2 (θ_dot)    |   K3 (φ_ddot)   |   K4 (θ_ddot)   |");
+    println!("|-----------|------------|-----------------|-----------------|-----------------|-----------------|");
+
+    if active_policies.is_empty() {
+        println!("|                           No policies survived the evaluation threshold.                        |");
+    } else {
+        for (p_idx, policy) in active_policies.iter() {
+            // Safely grab the very last recorded cost for this policy
+            let final_cost = cost_history[*p_idx].last().unwrap_or(&f64::NAN);
+
+            // Using {:.4} for the coefficients ensures 4 decimal places and standard notation.
+            // I bumped the width to 15 to account for the lack of 'e+0x' compression.
+            println!(
+                "| {:^9} | {:^10.4} | {:>15.4} | {:>15.4} | {:>15.4} | {:>15.4} |",
+                p_idx, final_cost, policy[0], policy[1], policy[2], policy[3]
+            );
+        }
+    }
+    println!("=================================================================================================\n");
+    println!("=================================================================================================\n");
 
     // --- 5. Plotting ---
     println!("Generating plot 'policy_evolution.png'...");
-    plot_cost_evolution(&cost_history, baseline_cost, n_updates)?;
+    // Note: If a policy was discarded early, its cost_history vector will simply be shorter.
+    plot_cost_evolution(
+        &cost_history,
+        baseline_cost,
+        n_updates,
+        evaluation_threshold,
+    )?;
 
     Ok(())
 }

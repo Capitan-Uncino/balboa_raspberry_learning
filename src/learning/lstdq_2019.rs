@@ -14,7 +14,7 @@ const GAMMA: f64 = 1.00; // Discount factor 0.99
 pub const SAMPLES_PER_ITER: usize = 100000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
 
-const BIAS_COMPENSATION: bool = true;
+const BIAS_COMPENSATION: bool = false;
 //
 //
 pub fn spectral_radius(
