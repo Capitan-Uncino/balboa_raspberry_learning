@@ -12,8 +12,8 @@ use std::error::Error;
 const ONLINE: bool = true;
 const NEW_BATCH: bool = false;
 const SIM: bool = true;
-const VISUALIZE: bool = false;
-const PLOT: bool = true;
+const VISUALIZE: bool = true;
+const PLOT: bool = false;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("========================================");

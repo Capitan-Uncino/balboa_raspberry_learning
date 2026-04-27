@@ -183,7 +183,11 @@ pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Er
     println!("Loading MuJoCo model 'balboa.xml'...");
 
     // mujoco-rs uses MjModel::from_xml for loading files
-    let model = MjModel::from_xml("balboa.xml").expect("Failed to load balboa.xml");
+    let model = if BACKLASH_JOINTS {
+        MjModel::from_xml("balboa_delay.xml").expect("Failed to load balboa.xml")
+    } else {
+        MjModel::from_xml("balboa.xml").expect("Failed to load balboa.xml")
+    };
 
     // Automatically allocates the physics state array based on the model
     let mut data = model.make_data();
@@ -288,7 +292,11 @@ pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Er
 
 pub fn run_data_collection_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading MuJoCo model 'balboa.xml'...");
-    let model = MjModel::from_xml("balboa.xml").expect("Failed to load balboa.xml");
+    let model = if BACKLASH_JOINTS {
+        MjModel::from_xml("balboa_delay.xml").expect("Failed to load balboa.xml")
+    } else {
+        MjModel::from_xml("balboa.xml").expect("Failed to load balboa.xml")
+    };
     let mut data = model.make_data();
     let data_dir = "collected_data";
 
@@ -357,7 +365,11 @@ pub fn run_sim_plot(
     uniform_half_interval: f64, // <-- Updated parameter
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading MuJoCo model 'balboa.xml'...");
-    let model = MjModel::from_xml("balboa.xml").expect("Failed to load balboa.xml");
+    let model = if BACKLASH_JOINTS {
+        MjModel::from_xml("balboa_delay.xml").expect("Failed to load balboa.xml")
+    } else {
+        MjModel::from_xml("balboa.xml").expect("Failed to load balboa.xml")
+    };
     let mut data = model.make_data();
     let mut viewer = MjViewer::launch_passive(&model, 60).expect("Failed to init viewer");
 
@@ -556,7 +568,7 @@ fn evaluate_policy_sim<'a>(
     enable_noise: bool,
 ) -> f64 {
     // --- EVALUATION PARAMETERS ---
-    let eval_steps = 10000; // 10 seconds of simulation at 100Hz
+    let eval_steps = 10000;
     let control_step: f64 = 0.01;
     let timestep: f64 = model.opt().timestep;
     let sim_steps = (control_step / timestep).round() as usize;
