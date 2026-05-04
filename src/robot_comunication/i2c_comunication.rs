@@ -1,6 +1,6 @@
+use crate::file_utils::get_next_file_index;
 use crate::learning::lstdq::{calculate_k, StateAction, ANALYTIC_LQR_POLICY, SAMPLES_PER_ITER};
-use crate::utils::file_utils::get_next_file_index;
-use crate::utils::graphic_utils::log_progress;
+use crate::logging_utils::log_progress;
 use rppal::gpio::{Gpio, Trigger};
 use rppal::i2c::I2c;
 use std::error::Error;

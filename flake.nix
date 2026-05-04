@@ -2,77 +2,55 @@
   description = "Rust + MuJoCo Environment pinned to nixpkgs commit 09061f748ee21f68a089cd5d91ec1859cd93d0be";
 
   inputs = {
-    # Pinned to the specific commit providing your target MuJoCo version
     nixpkgs.url = "github:NixOS/nixpkgs/09061f748ee21f68a089cd5d91ec1859cd93d0be";
+    # 1. Add rust-overlay to get target-specific toolchains
+    rust-overlay.url = "github:oxalica/rust-overlay";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, rust-overlay }:
     let
-      # Define the system you are building for
       system = "x86_64-linux"; 
-      pkgs = nixpkgs.legacyPackages.${system};
+      
+      # Apply the overlay
+      overlays = [ (import rust-overlay) ];
+      pkgs = import nixpkgs { inherit system overlays; };
 
-      # Grouped runtime libraries needed for both buildInputs and LD_LIBRARY_PATH
+      # 2. Define a custom Rust toolchain that includes the aarch64 target
+      rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+        targets = [ "aarch64-unknown-linux-gnu" ];
+      };
+
       runtimeLibs = with pkgs; [
-        mujoco
-        udev
-        libGL
-        glfw
-        wayland
-        libxkbcommon
-        libdecor 
-        
-        fontconfig
-        
-        # X11 dependencies
-        libx11
-        libxrandr
-        libxi
-        libxcursor
-        libxext
-        libxinerama
-        
-        # Very important for libstdc++
-        stdenv.cc.cc.lib
+        mujoco udev libGL glfw wayland
+        libxkbcommon libdecor fontconfig
+        libx11 libxrandr libxi libxcursor
+        libxext libxinerama stdenv.cc.cc.lib
       ];
     in
     {
       devShells.${system}.default = pkgs.mkShell {
-        # nativeBuildInputs: Tools needed at compile-time
         nativeBuildInputs = with pkgs; [
-          mujoco
-          pkg-config
-          rustc
+          rustToolchain     # Replaces 'rustc' and 'cargo'
           cargo-cross
-          cargo 
           rust-analyzer
-          gcc             # Provides the 'cc' linker
-          binutils        # Provides 'ld' and other binary tools
+          pkg-config gcc binutils mujoco
         ];
 
-        # buildInputs: Libraries needed at compile-time and run-time
         buildInputs = runtimeLibs;
 
-        # ==========================================
-        # RUST BUILD-TIME FIXES
-        # ==========================================
         MUJOCO_DYNAMIC_LINK_DIR = "${pkgs.mujoco}/lib";
         CPATH = "${pkgs.mujoco}/include";
-
-        # ==========================================
-        # RUNTIME FIXES
-        # ==========================================
-        # This ensures egui and mujoco can find the .so files at runtime
         LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
-        
         MUJOCO_GL = "glfw"; 
 
         shellHook = ''
           echo "========================================="
           echo "🦀 Rust + MuJoCo Environment (Fixed Linker)"
           echo "========================================="
-          # This points Cargo to the correct linker provided by Nix
           export RUSTFLAGS="-C linker=cc"
+          
+          # 3. Inform cross-rs that the toolchain is manually managed
+          export CROSS_CUSTOM_TOOLCHAIN=1
         '';
       };
     };

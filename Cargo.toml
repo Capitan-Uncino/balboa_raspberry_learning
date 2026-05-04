@@ -3,10 +3,23 @@ name = "lspi_diagnostics"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# By default, both features are enabled. 
+# Disable them using `--no-default-features` when cross-compiling for the robot.
+default = ["sim", "graphics"]
+sim = ["dep:mujoco-rs"]
+graphics = ["dep:plotters"]
+
 [dependencies]
 nalgebra = "0.34.2"
 rand = "0.10.1"
 rand_distr = "0.6.0"
 rppal = "0.22.1"
-mujoco-rs = { version = "3.0.1+mj-3.6.0", features = ["viewer-ui"] }
-plotters = "0.3.7"
+
+# Made optional: tied to the "sim" feature
+mujoco-rs = { version = "3.0.1+mj-3.6.0", features = [
+  "viewer-ui",
+], optional = true }
+
+# Made optional: tied to the "graphics" feature
+plotters = { version = "0.3.7", optional = true }

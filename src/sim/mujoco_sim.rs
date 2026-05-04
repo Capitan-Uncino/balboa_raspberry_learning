@@ -1,8 +1,9 @@
+use crate::file_utils::get_next_file_index;
+use crate::graphic_utils::plot_cost_evolution;
 use crate::learning::lstdq_2019::{
     calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, SAMPLES_PER_ITER,
 };
-use crate::utils::file_utils::get_next_file_index;
-use crate::utils::graphic_utils::{log_progress, plot_cost_evolution};
+use crate::logging_utils::log_progress;
 use mujoco_rs::prelude::*;
 use mujoco_rs::viewer::MjViewer;
 use nalgebra::{SMatrix, SVector};
