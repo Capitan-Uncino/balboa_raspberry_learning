@@ -21,7 +21,7 @@
         wayland
         libxkbcommon
         libdecor 
-
+        
         fontconfig
         
         # X11 dependencies
@@ -43,6 +43,7 @@
           mujoco
           pkg-config
           rustc
+          cargo-cross
           cargo 
           rust-analyzer
           gcc             # Provides the 'cc' linker

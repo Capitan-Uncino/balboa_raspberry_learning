@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 const THETA_OU: f64 = 0.30;
 const SIGMA_OU: f64 = 0.10;
 const SEED: u64 = 42;
-const BACKLASH_JOINTS: bool = false;
+const BACKLASH_JOINTS: bool = true;
 
 fn collect_full_batch_sim<'a>(
     model: &'a MjModel,
@@ -85,7 +85,7 @@ fn collect_full_batch_sim<'a>(
         let max_physical_torque = 0.1;
         let pwm_resolution = 400.0;
 
-        let tau_total = u_raw + last_noise;
+        let tau_total = u_raw + epsilon * SIGMA_OU;
         let raw_tau = tau_total / 2.0;
 
         let raw_tau_offset = if phi_dot > 0.0f64 {
