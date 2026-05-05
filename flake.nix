@@ -1,9 +1,8 @@
 {
-  description = "Rust + MuJoCo Environment pinned to nixpkgs commit 09061f748ee21f68a089cd5d91ec1859cd93d0be";
+  description = "Rust + MuJoCo Environment (Native Cross-Compile)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/09061f748ee21f68a089cd5d91ec1859cd93d0be";
-    # 1. Add rust-overlay to get target-specific toolchains
     rust-overlay.url = "github:oxalica/rust-overlay";
   };
 
@@ -11,14 +10,15 @@
     let
       system = "x86_64-linux"; 
       
-      # Apply the overlay
       overlays = [ (import rust-overlay) ];
       pkgs = import nixpkgs { inherit system overlays; };
 
-      # 2. Define a custom Rust toolchain that includes the aarch64 target
       rustToolchain = pkgs.rust-bin.stable.latest.default.override {
         targets = [ "aarch64-unknown-linux-gnu" ];
       };
+
+      # ✨ THE MAGIC: Nix's native ARM64 GCC cross-compiler
+      crossLinker = pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc;
 
       runtimeLibs = with pkgs; [
         mujoco udev libGL glfw wayland
@@ -30,10 +30,10 @@
     {
       devShells.${system}.default = pkgs.mkShell {
         nativeBuildInputs = with pkgs; [
-          rustToolchain     # Replaces 'rustc' and 'cargo'
-          cargo-cross
+          rustToolchain
           rust-analyzer
-          pkg-config gcc binutils mujoco
+          pkg-config mujoco binutils
+          crossLinker # Injects the aarch64 gcc into the shell
         ];
 
         buildInputs = runtimeLibs;
@@ -45,12 +45,14 @@
 
         shellHook = ''
           echo "========================================="
-          echo "🦀 Rust + MuJoCo Environment (Fixed Linker)"
+          echo "🦀 Rust Native Cross-Compilation Active"
           echo "========================================="
-          export RUSTFLAGS="-C linker=cc"
           
-          # 3. Inform cross-rs that the toolchain is manually managed
-          export CROSS_CUSTOM_TOOLCHAIN=1
+          # Remove the old global RUSTFLAGS so we don't force 'cc' everywhere
+          unset RUSTFLAGS
+          
+          # Tell Cargo exactly which linker to use when targeting aarch64
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-unknown-linux-gnu-gcc"
         '';
       };
     };

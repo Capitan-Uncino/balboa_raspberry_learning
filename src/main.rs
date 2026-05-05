@@ -19,11 +19,11 @@ use std::error::Error;
 #[cfg(feature = "sim")]
 use sim::mujoco_sim::{run_data_collection_mode_sim, run_online_mode_sim, run_sim_plot};
 
-const ONLINE: bool = true;
-const NEW_BATCH: bool = false;
-const SIM: bool = true;
+const ONLINE: bool = false;
+const NEW_BATCH: bool = true;
+const SIM: bool = false;
 const VISUALIZE: bool = false;
-const PLOT: bool = true;
+const PLOT: bool = false;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("========================================");
@@ -67,4 +67,3 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
-
