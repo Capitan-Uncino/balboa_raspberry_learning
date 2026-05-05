@@ -12,7 +12,7 @@ mod graphic_utils;
 mod sim;
 
 use batch_analisys::single_batch_analisys::run_offline_computation_mode;
-use robot_comunication::i2c_comunication::{run_data_collection_mode, run_online_mode};
+use robot_comunication::serial_comunication::{run_data_collection_mode, run_online_mode};
 use std::error::Error;
 
 // Conditionally import the sim functions
