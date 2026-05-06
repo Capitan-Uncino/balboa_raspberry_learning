@@ -1,4 +1,4 @@
-use crate::learning::lstdq::{calculate_k, StateAction, ANALYTIC_LQR_POLICY};
+use crate::learning::lstdq_no_bias_correction::{calculate_k, StateAction, ANALYTIC_LQR_POLICY};
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, Read, Write};

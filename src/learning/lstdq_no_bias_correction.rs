@@ -1,21 +1,21 @@
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
-
-pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.182574, 4.412952, 0.098523, 0.441536];
+pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.18257419, 4.41295298, 0.098522314, 0.44153694];
 
 pub const DT: f64 = 0.01;
 
 // --- System Dimensions ---
-pub const DIM_X: usize = 4; // [theta, theta_dot]
-pub const DIM_U: usize = 1; // [torque]
+pub const DIM_X: usize = 4;
+pub const DIM_U: usize = 1;
 const DIM_X_AND_U: usize = DIM_X + DIM_U;
 const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 
 // --- LSPI Hyperparameters ---
-const GAMMA: f64 = 0.99; // Discount factor
+const GAMMA: f64 = 1.00; // Discount factor 0.99
 pub const SAMPLES_PER_ITER: usize = 100000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
-const ETA: f64 = 0.0f64;
 
+//
+//
 pub fn spectral_radius(
     a_mat: &SMatrix<f64, DIM_X, DIM_X>,
     b_mat: &SMatrix<f64, DIM_X, DIM_U>,
@@ -94,41 +94,21 @@ fn run_lstdq(batch: Vec<StateAction>, k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector
     ]));
     let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([300.0]));
 
-    // Construct matrix M = [I; K]
-    let mut m_mat = SMatrix::<f64, DIM_X_AND_U, DIM_X>::zeros();
-    m_mat
-        .fixed_view_mut::<DIM_X, DIM_X>(0, 0)
-        .copy_from(&SMatrix::<f64, DIM_X, DIM_X>::identity());
-    m_mat.fixed_view_mut::<DIM_U, DIM_X>(DIM_X, 0).copy_from(k);
-
-    // Compute the outer product: P = M * M^T
-    let p_mat = m_mat * m_mat.transpose();
-
-    // Vectorize P to get the bias vector: bias = eta * svec(P)
-    let mut bias_vec = SVector::<f64, DIM_PARAMS>::zeros();
-    let mut idx = 0;
-    for i in 0..DIM_X_AND_U {
-        for j in i..DIM_X_AND_U {
-            let val = p_mat[(i, j)];
-            bias_vec[idx] = val * ETA;
-            idx += 1;
-        }
-    }
+    let mut skipped_couples = 0;
+    let state_jump_threshold = 2.0;
 
     // 2. Iterate directly over the raw chronological batch
-    // We stop at batch.len() - 1 because we need a "next" state for every "current" state
     for i in 0..(batch.len() - 1) {
         let current = &batch[i];
         let next = &batch[i + 1];
 
-        // Construct mathematical vectors directly from the I2C structs
+        // Construct mathematical vectors directly from the I2C structs FIRST
         let x = SVector::<f64, DIM_X>::from_column_slice(&[
             current.phi,
             current.theta,
             current.phi_dot,
             current.theta_dot,
         ]);
-        let u = SVector::<f64, DIM_U>::from_column_slice(&[current.u]);
 
         let x_next = SVector::<f64, DIM_X>::from_column_slice(&[
             next.phi,
@@ -137,21 +117,32 @@ fn run_lstdq(batch: Vec<StateAction>, k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector
             next.theta_dot,
         ]);
 
-        // Cost calculation using our local Q and R
+        // --- NEW: Discontinuity check ---
+        // If the state changes too drastically in one timestep, it implies a reset/fall.
+        let state_diff_norm = (x - x_next).norm();
+        if state_diff_norm > state_jump_threshold {
+            skipped_couples += 1;
+            continue; // Skip this transition entirely
+        }
+
+        let u = SVector::<f64, DIM_U>::from_column_slice(&[current.u]);
+
+        // ct := xt^T S xt + ut^T R ut
         let cost = x.dot(&(q_cost * x)) + u.dot(&(r_cost * u));
 
-        // Feature computation with BIAS using the NOISY action applied
-        let phi = get_quadratic_features(&x, &u) + bias_vec;
+        // phi_t := phi(xt, ut)
+        let phi_t = get_quadratic_features(&x, &u);
 
-        // Target policy uses the current gain matrix K (Greedy action)
+        // psi_{t+1} := phi(x_{next}, Keval * x_{next})
         let u_next_greedy = k * x_next;
-        let phi_next = get_quadratic_features(&x_next, &u_next_greedy) + bias_vec;
+        let psi_t_plus_1 = get_quadratic_features(&x_next, &u_next_greedy);
 
-        // LSTDQ Update
-        let temporal_diff = phi - (GAMMA * phi_next);
+        // LSTDQ Update mapping to: phi_t * (phi_t - psi_{t+1} + f)^T
+        //
+        let temporal_diff = phi_t - (GAMMA * psi_t_plus_1);
 
         for r in 0..DIM_PARAMS {
-            let phi_r = phi[r];
+            let phi_r = phi_t[r];
             b_vec[r] += phi_r * cost;
             for c in 0..DIM_PARAMS {
                 a_mat[(r, c)] += phi_r * temporal_diff[c];
@@ -159,23 +150,30 @@ fn run_lstdq(batch: Vec<StateAction>, k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector
         }
     }
 
+    // --- NEW: Print the results ---
+    let total_couples = batch.len().saturating_sub(1);
+    println!(
+        "LSTDQ Batch Processing: Skipped {} / {} transitions due to discontinuity.",
+        skipped_couples, total_couples
+    );
+
     // Apply L2 Regularization
     for i in 0..DIM_PARAMS {
         a_mat[(i, i)] += LAMBDA_REG;
     }
 
-    // Solve for theta
-    let theta_dyn = a_mat
+    // Solve for q-function parameters
+    let q_dyn = a_mat
         .lu()
         .solve(&b_vec)
         .unwrap_or(DVector::zeros(DIM_PARAMS));
 
-    let mut theta = SVector::<f64, DIM_PARAMS>::zeros();
-    theta.copy_from_slice(theta_dyn.as_slice());
+    let mut q_params = SVector::<f64, DIM_PARAMS>::zeros();
+    q_params.copy_from_slice(q_dyn.as_slice());
 
-    theta
-} // --- Helpers ---
-  //
+    q_params
+}
+
 pub fn calculate_k(
     batch: Vec<StateAction>,
     current_k: &SMatrix<f64, DIM_U, DIM_X>,

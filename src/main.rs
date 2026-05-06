@@ -20,7 +20,7 @@ use std::error::Error;
 use sim::mujoco_sim::{run_data_collection_mode_sim, run_online_mode_sim, run_sim_plot};
 
 const ONLINE: bool = false;
-const NEW_BATCH: bool = true;
+const NEW_BATCH: bool = false;
 const SIM: bool = false;
 const VISUALIZE: bool = false;
 const PLOT: bool = false;
