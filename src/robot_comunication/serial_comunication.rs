@@ -9,28 +9,27 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-// CHANGE THIS TO MATCH YOUR COMPUTER'S USB PORT!
-const PORT_NAME: &str = "/dev/ttyACM0"; // Mac/Linux example: "/dev/ttyACM0"
+const PORT_NAME: &str = "/dev/ttyACM0";
 const BAUD_RATE: u32 = 115200;
 
-/// Reads exactly one telemetry packet from the Arduino, syncing via the 0xCC 0xDD header
+/// Reads exactly one telemetry packet, immune to float byte collisions
 fn read_telemetry_packet(port: &mut dyn SerialPort, buf: &mut [u8; 20]) -> bool {
-    let mut header = [0u8; 1];
-    let mut found_cc = false;
+    let mut header = [0u8; 4];
+    let magic = [0xDD, 0xCC, 0xBB, 0xAA];
 
-    // Read byte-by-byte until we find the magic header
+    // Shift buffer one byte at a time until the exact 4-byte header matches
     loop {
-        if port.read(&mut header).is_ok() {
-            if found_cc && header[0] == 0xDD {
-                // Header found! Read the next 20 bytes of floating point data
+        let mut b = [0u8; 1];
+        if port.read(&mut b).is_ok() {
+            header[0] = header[1];
+            header[1] = header[2];
+            header[2] = header[3];
+            header[3] = b[0];
+
+            if header == magic {
                 return port.read_exact(buf).is_ok();
-            } else if header[0] == 0xCC {
-                found_cc = true;
-            } else {
-                found_cc = false;
             }
         } else {
-            // Read timed out (Arduino disconnected or stopped sending)
             return false;
         }
     }
@@ -124,26 +123,18 @@ fn collect_full_batch(
 }
 
 fn write_gains(serial_bus: &Arc<Mutex<Box<dyn SerialPort>>>, gains: [f32; 4]) {
-    let mut write_buf = Vec::with_capacity(18);
-    // Add the PC -> Arduino binary header
-    write_buf.push(0xAA);
-    write_buf.push(0xBB);
+    let mut write_buf = Vec::with_capacity(20);
+    // Add the new 4-byte bulletproof header
+    write_buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
 
     for k in &gains {
         write_buf.extend_from_slice(&k.to_le_bytes());
     }
 
     if let Ok(mut port) = serial_bus.lock() {
-        println!(
-            "---> Sending Gains: [k1: {:.3}, k2: {:.3}, k3: {:.3}, k4: {:.3}]",
-            gains[0], gains[1], gains[2], gains[3]
-        );
-
         if let Err(e) = port.write_all(&write_buf) {
             eprintln!("Serial Write Error: {:?}", e);
         }
-    } else {
-        eprintln!("Failed to acquire Serial lock for writing.");
     }
 }
 
@@ -188,14 +179,13 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
             }
 
             let new_k_array = [
-                new_k_mat[(0, 0)] as f32,
-                new_k_mat[(0, 1)] as f32,
-                new_k_mat[(0, 2)] as f32,
-                new_k_mat[(0, 3)] as f32,
+                new_k_mat[(0, 0)] as f32, // k_phi
+                new_k_mat[(0, 2)] as f32, // k_theta    (Index 2 in LQR math!)
+                new_k_mat[(0, 1)] as f32, // k_phiDot   (Index 1 in LQR math!)
+                new_k_mat[(0, 3)] as f32, // k_thetaDot
             ];
 
             *pending_clone.lock().unwrap() = Some(new_k_array);
-            println!(">>> LSTDQ Update: New K vector queued for next USB window.");
         });
     }
 }
