@@ -11,9 +11,9 @@ const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 
 // --- LSPI Hyperparameters ---
 const GAMMA: f64 = 1.00; // Discount factor 0.99
-pub const SAMPLES_PER_ITER: usize = 10000; // Samples per policy evaluation
+pub const SAMPLES_PER_ITER: usize = 500000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
-
+const MAX_DISCONTINUITIES: usize = 15;
 const BIAS_COMPENSATION: bool = false;
 //
 //
@@ -186,17 +186,41 @@ fn run_lstdq(
         }
     }
 
-    // --- NEW: Print the results ---
     let total_couples = batch.len().saturating_sub(1);
     println!(
         "LSTDQ Batch Processing: Skipped {} / {} transitions due to discontinuity.",
         skipped_couples, total_couples
     );
 
+    // --- NEW: Abort if discontinuities exceed threshold ---
+    if skipped_couples > MAX_DISCONTINUITIES {
+        println!(
+            "\x1b[31m[WARNING] Discontinuities ({}) exceeded MAX_DISCONTINUITIES ({}). Aborting update and returning zero parameters.\x1b[0m",
+            skipped_couples, MAX_DISCONTINUITIES
+        );
+        return SVector::<f64, DIM_PARAMS>::zeros();
+    }
+    // -----------------------------------------------------
+
     // Apply L2 Regularization
     for i in 0..DIM_PARAMS {
         a_mat[(i, i)] += LAMBDA_REG;
     }
+
+    let svd = a_mat.clone().svd(false, false);
+    let max_sv = svd.singular_values[0];
+    let min_sv = svd.singular_values[DIM_PARAMS - 1];
+
+    let condition_number = if min_sv > 1e-12 {
+        max_sv / min_sv
+    } else {
+        std::f64::INFINITY
+    };
+
+    println!(
+        "LSTDQ A matrix Condition Number: {:.4e} (Max SV: {:.4e}, Min SV: {:.4e})",
+        condition_number, max_sv, min_sv
+    );
 
     // Solve for q-function parameters
     let q_dyn = a_mat

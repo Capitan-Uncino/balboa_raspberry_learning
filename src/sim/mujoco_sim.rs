@@ -16,10 +16,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const THETA_OU: f64 = 0.30;
-const SIGMA_OU: f64 = 0.10;
+const THETA_OU: f64 = 0.80;
+const SIGMA_OU: f64 = 0.50;
 const SEED: u64 = 42;
 const BACKLASH_JOINTS: bool = true;
+const MAX_FALLS: usize = 20;
 
 fn collect_full_batch_sim<'a>(
     model: &'a MjModel,
@@ -36,6 +37,9 @@ fn collect_full_batch_sim<'a>(
     let mut state_batch = Vec::with_capacity(SAMPLES_PER_ITER);
     let mut loop_counter = 0;
     let mut stability_counter = 0;
+
+    // --- NEW: Track the number of falls ---
+    let mut fall_count = 0;
 
     let stability_threshold = 10;
     let stop_angle_rad = 60.0_f64.to_radians();
@@ -80,13 +84,17 @@ fn collect_full_batch_sim<'a>(
         let u1: f64 = rng.random_range(0.0001..1.0);
         let u2: f64 = rng.random_range(0.0..1.0);
         let epsilon = (-2.0f64 * u1.ln()).sqrt() * (2.0f64 * PI * u2).cos();
-        let dx = THETA_OU * (-last_noise) * 0.01 + SIGMA_OU * epsilon * 0.1;
+
+        // Corrected dt scaling for OU noise
+        let dt: f64 = 0.01;
+        let sqrt_dt = dt.sqrt();
+        let dx = THETA_OU * (-last_noise) * dt + SIGMA_OU * epsilon * sqrt_dt;
         last_noise += dx;
 
-        let max_physical_torque = 0.1;
+        let max_physical_torque = 0.22;
         let pwm_resolution = 400.0;
 
-        let tau_total = u_raw + epsilon * SIGMA_OU;
+        let tau_total = u_raw + last_noise;
         let raw_tau = tau_total / 2.0;
 
         let raw_tau_offset = if phi_dot > 0.0f64 {
@@ -96,7 +104,7 @@ fn collect_full_batch_sim<'a>(
         };
 
         // Back-EMF constraints using raw velocities
-        let max_speed = 25.0;
+        let max_speed = 47.5;
         let avail_l = max_physical_torque * (0.0f64.max(1.0 - (phi_dot_left.abs() / max_speed)));
         let avail_r = max_physical_torque * (0.0f64.max(1.0 - (phi_dot_right.abs() / max_speed)));
 
@@ -160,13 +168,27 @@ fn collect_full_batch_sim<'a>(
         } else {
             stability_counter = 0;
             if *was_balancing {
+                fall_count += 1; // Increment fall counter
+
                 println!(
-                    "<<< [SIM] ROBOT FELL: Pausing {} (Collected: {}/{})",
+                    "<<< [SIM] ROBOT FELL: Pausing {} (Collected: {}/{}) | Falls: {}/{}",
                     log_label,
                     state_batch.len(),
-                    SAMPLES_PER_ITER
+                    SAMPLES_PER_ITER,
+                    fall_count,
+                    MAX_FALLS
                 );
                 *was_balancing = false;
+
+                // --- NEW: Abort if MAX_FALLS is exceeded ---
+                if fall_count > MAX_FALLS {
+                    println!(
+                        "\x1b[31m[WARNING] Falls ({}) exceeded MAX_FALLS ({}). Aborting data collection and discarding batch.\x1b[0m",
+                        fall_count, MAX_FALLS
+                    );
+                    return Vec::new();
+                }
+                // -------------------------------------------
 
                 data.reset();
                 data.qpos_mut()[2] = 0.05;
@@ -907,10 +929,7 @@ pub fn estimate_process_noise<'a>(
 }
 
 // Helper function to extract raw state cleanly, supporting both XML models
-fn extract_state<'a>(
-    data: &MjData<&'a MjModel>,
-    has_backlash: bool,
-) -> (f64, f64, f64, f64, f64, f64) {
+fn extract_state(data: &MjData<&MjModel>, has_backlash: bool) -> (f64, f64, f64, f64, f64, f64) {
     let qpos = data.qpos();
     let qvel = data.qvel();
 

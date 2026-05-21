@@ -22,8 +22,8 @@ use sim::mujoco_sim::{run_data_collection_mode_sim, run_online_mode_sim, run_sim
 const ONLINE: bool = true;
 const NEW_BATCH: bool = false;
 const SIM: bool = true;
-const VISUALIZE: bool = true;
-const PLOT: bool = false;
+const VISUALIZE: bool = false;
+const PLOT: bool = true;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("========================================");
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             #[cfg(feature = "sim")]
             {
                 if PLOT {
-                    run_sim_plot(VISUALIZE, 30.0, 10, 5, 0.5)?;
+                    run_sim_plot(VISUALIZE, 10.0, 5, 3, 0.2)?;
                 } else {
                     run_online_mode_sim(VISUALIZE)?;
                 }
