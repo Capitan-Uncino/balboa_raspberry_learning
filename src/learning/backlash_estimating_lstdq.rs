@@ -1,25 +1,21 @@
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 use std::f64::consts::PI;
 
-// --- PUBLIC CONSTANTS (Fully 5-State API) ---
-// Added 0.0 for the 5th state initialization
+// Added a 0.0 at the end for the new backlash state
 pub const ANALYTIC_LQR_POLICY: [f64; 5] = [0.18257419, 4.41295298, 0.098522314, 0.44153694, 0.0];
+
 pub const DT: f64 = 0.01;
 
-// --- Backlash Constants ---
-pub const TOTAL_BACKLASH: f64 = 3.0 * PI / 180.0;
-pub const DEADZONE_EPSILON: f64 = TOTAL_BACKLASH / 2.0;
-
 // --- System Dimensions ---
-pub const DIM_X: usize = 5; // Policy is fully 5D
+pub const DIM_X: usize = 5; // Updated to 5 to include backlash
 pub const DIM_U: usize = 1;
 const DIM_X_AND_U: usize = DIM_X + DIM_U; // 6
-const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2; // 21
+const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2; // (6 * 7) / 2 = 21
 
 // --- LSPI Hyperparameters ---
-const GAMMA: f64 = 1.00;
-pub const SAMPLES_PER_ITER: usize = 100000;
-const LAMBDA_REG: f64 = 1e-5;
+const GAMMA: f64 = 1.00; // Discount factor
+pub const SAMPLES_PER_ITER: usize = 100000; // Samples per policy evaluation
+const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
 
 pub fn spectral_radius(
     a_mat: &SMatrix<f64, DIM_X, DIM_X>,
@@ -33,14 +29,14 @@ pub fn spectral_radius(
         .fold(0.0, |a, b| f64::max(a, b))
 }
 
-// --- Data Struct: Strictly 4 Physical States ---
-// The batch relies entirely on raw sensor data.
+// 5-State struct for LSPI
 #[derive(Debug, Clone, Copy)]
 pub struct StateAction {
     pub phi: f64,
     pub theta: f64,
     pub phi_dot: f64,
     pub theta_dot: f64,
+    pub backlash: f64,
     pub u: f64,
 }
 
@@ -89,62 +85,34 @@ fn compute_k_from_h(h_mat: &SMatrix<f64, DIM_X_AND_U, DIM_X_AND_U>) -> SMatrix<f
     }
 }
 
-pub fn run_lstdq(
-    batch: &[StateAction],
-    k: &SMatrix<f64, DIM_U, DIM_X>,
-) -> SVector<f64, DIM_PARAMS> {
+// Updated signature to take slice &[StateAction] instead of Vec
+fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f64, DIM_PARAMS> {
     let mut a_mat = DMatrix::<f64>::zeros(DIM_PARAMS, DIM_PARAMS);
     let mut b_vec = DVector::<f64>::zeros(DIM_PARAMS);
 
+    // 5x5 Q-Matrix. Backlash penalty is strictly 0.0
     let q_cost = SMatrix::<f64, DIM_X, DIM_X>::from_diagonal(&SVector::from([
         10.0,  // phi penalty
         100.0, // theta penalty
         1.0,   // phi_dot penalty
         10.0,  // theta_dot penalty
-        0.0,   // Backlash tracking penalty must be strictly 0
+        0.0,   // backlash penalty MUST remain 0
     ]));
     let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([300.0]));
 
     let mut skipped_couples = 0;
     let state_jump_threshold = 2.0;
 
-    let mut current_b = 0.0;
-
     for i in 0..(batch.len() - 1) {
         let current = &batch[i];
         let next = &batch[i + 1];
 
-        // Validate continuity against original 4 physical states
-        let phys_current = SVector::<f64, 4>::from_column_slice(&[
-            current.phi,
-            current.theta,
-            current.phi_dot,
-            current.theta_dot,
-        ]);
-        let phys_next = SVector::<f64, 4>::from_column_slice(&[
-            next.phi,
-            next.theta,
-            next.phi_dot,
-            next.theta_dot,
-        ]);
-
-        if (phys_current - phys_next).norm() > state_jump_threshold {
-            skipped_couples += 1;
-            current_b = 0.0; // Reset estimator if discontinuity occurs
-            continue;
-        }
-
-        // Hysteresis tracking: estimate the 5th state dynamically
-        let delta_abs_motor = (next.phi - current.phi) + (next.theta - current.theta);
-        let next_b = (current_b + delta_abs_motor).clamp(-DEADZONE_EPSILON, DEADZONE_EPSILON);
-
-        // Construct full 5D state vectors
         let x = SVector::<f64, DIM_X>::from_column_slice(&[
             current.phi,
             current.theta,
             current.phi_dot,
             current.theta_dot,
-            current_b,
+            current.backlash,
         ]);
 
         let x_next = SVector::<f64, DIM_X>::from_column_slice(&[
@@ -152,10 +120,17 @@ pub fn run_lstdq(
             next.theta,
             next.phi_dot,
             next.theta_dot,
-            next_b,
+            next.backlash,
         ]);
 
+        let state_diff_norm = (x - x_next).norm();
+        if state_diff_norm > state_jump_threshold {
+            skipped_couples += 1;
+            continue;
+        }
+
         let u = SVector::<f64, DIM_U>::from_column_slice(&[current.u]);
+
         let cost = x.dot(&(q_cost * x)) + u.dot(&(r_cost * u));
         let phi_t = get_quadratic_features(&x, &u);
 
@@ -171,8 +146,6 @@ pub fn run_lstdq(
                 a_mat[(r, c)] += phi_r * temporal_diff[c];
             }
         }
-
-        current_b = next_b;
     }
 
     let total_couples = batch.len().saturating_sub(1);
@@ -181,9 +154,39 @@ pub fn run_lstdq(
         skipped_couples, total_couples
     );
 
+    // Apply L2 Regularization
     for i in 0..DIM_PARAMS {
         a_mat[(i, i)] += LAMBDA_REG;
     }
+
+    // Print Matrix A Diagnostics
+    let eigvals = a_mat.complex_eigenvalues();
+    let mut max_eig = 0.0_f64;
+    let mut min_eig = f64::MAX;
+
+    for c in eigvals.iter() {
+        let norm = c.norm();
+        if norm > max_eig {
+            max_eig = norm;
+        }
+        if norm < min_eig {
+            min_eig = norm;
+        }
+    }
+
+    let svd = a_mat.clone().svd(false, false);
+    let cond_num = if svd.singular_values.len() > 0 {
+        let max_sv = svd.singular_values[0];
+        let min_sv = svd.singular_values[svd.singular_values.len() - 1];
+        max_sv / min_sv
+    } else {
+        f64::NAN
+    };
+
+    println!(
+        "Matrix A Diagnostics | Cond Num: {:.4e} | Min Eig: {:.4e} | Max Eig: {:.4e}",
+        cond_num, min_eig, max_eig
+    );
 
     let q_dyn = a_mat
         .lu()
@@ -195,12 +198,36 @@ pub fn run_lstdq(
 
     q_params
 }
-
 pub fn calculate_k(
     batch: &[StateAction],
     current_k: &SMatrix<f64, DIM_U, DIM_X>,
 ) -> SMatrix<f64, DIM_U, DIM_X> {
-    let theta = run_lstdq(batch, current_k);
+    // 1.5 degrees in radians is ~0.026. Multiplying by 40 brings the
+    // numerical range to ~1.0, matching the scale of phi and theta.
+    const BACKLASH_SCALE: f64 = 40.0;
+
+    // 1. Scale the dataset for the LSPI solver
+    let mut scaled_batch = batch.to_vec();
+    for state in scaled_batch.iter_mut() {
+        state.backlash *= BACKLASH_SCALE;
+    }
+
+    // 2. Scale the input K matrix (K_scaled = K_phys * S^-1)
+    let mut scaled_k = *current_k;
+    scaled_k[(0, 4)] /= BACKLASH_SCALE;
+
+    // 3. Run LSPI in the well-conditioned scaled space
+    let theta = run_lstdq(&scaled_batch, &scaled_k);
     let h_mat = theta_to_h(&theta);
-    compute_k_from_h(&h_mat)
+    let new_scaled_k = compute_k_from_h(&h_mat);
+
+    // 4. Un-scale the resulting K matrix back to physical units (K_phys = K_scaled * S)
+    // This allows your robot to use the matrix directly with raw sensor data!
+    let mut new_k = new_scaled_k;
+    new_k[(0, 4)] *= BACKLASH_SCALE;
+
+    // Print the physical policy
+    println!("Calculated Policy K (Physical Units): {}", new_k);
+
+    new_k
 }
