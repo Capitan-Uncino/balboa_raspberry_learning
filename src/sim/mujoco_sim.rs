@@ -271,9 +271,9 @@ pub fn run_sim_plot(
     println!("Baseline Cost: {:.4}", baseline_cost);
 
     // --- 2. Generate N Policies via Uniform Perturbation ---
-    let mut rng = rand::rng();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
-    let uniform_dist = Uniform::new_inclusive(
+    let uniform_dist = rand::distr::Uniform::new_inclusive(
         1.0f64 - uniform_half_interval,
         1.0f64 + uniform_half_interval,
     )
@@ -283,8 +283,6 @@ pub fn run_sim_plot(
     let mut active_policies: Vec<(usize, [f64; DIM_X])> = (0..n_policies)
         .map(|id| {
             let p: [f64; DIM_X] = std::array::from_fn(|i| {
-                // If it's the 5th element (backlash) and it starts at 0.0,
-                // multiplying by uniform sample keeps it 0.0 (which is correct)
                 initial_k_array[i] * rand::distr::Distribution::sample(&uniform_dist, &mut rng)
             });
             (id, p)
@@ -313,12 +311,15 @@ pub fn run_sim_plot(
                     "  [!] Policy {} exceeded threshold ({:.4} > {:.4}). Discarding from training.",
                     p_idx, empirical_cost, evaluation_threshold
                 );
+
+                cost_history[p_idx].resize(n_updates + 1, f64::NAN);
                 continue;
             }
 
             // B) BATCH COLLECTION PHASE (Noise ON)
             let mut active_gains = policy;
-            let pending_gains: Arc<Mutex<Option<[f64; DIM_X]>>> = Arc::new(Mutex::new(None));
+            let pending_gains: std::sync::Arc<std::sync::Mutex<Option<[f64; DIM_X]>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
             let mut was_balancing = false;
 
             let batch_to_process = collect_full_batch_sim(
@@ -335,9 +336,13 @@ pub fn run_sim_plot(
             );
 
             if batch_to_process.is_empty() {
-                println!("  [!] Batch empty, user likely exited early.");
-                next_active_policies.push((p_idx, policy));
-                continue;
+                println!(
+                    "  [!] Batch empty (too many falls or early exit). Discarding policy {}.",
+                    p_idx
+                );
+
+                cost_history[p_idx].resize(n_updates + 1, f64::NAN);
+                continue; // Do NOT push to next_active_policies
             }
 
             // C) UPDATE PHASE (Synchronous)
@@ -378,7 +383,7 @@ pub fn run_sim_plot(
     }
 
     if active_policies.is_empty() {
-        println!("|                            No policies survived the evaluation threshold.                                       |");
+        println!("|                           No policies survived the evaluation threshold.                                        |");
     } else {
         for (p_idx, policy) in active_policies.iter() {
             let final_cost = cost_history[*p_idx].last().unwrap_or(&f64::NAN);
@@ -409,7 +414,6 @@ pub fn run_sim_plot(
 
     Ok(())
 }
-
 // --- 1. CALCULATE ANALYTICAL A AND B MATRICES ---
 /*
 let mw: f64 = 0.0042;
@@ -501,7 +505,10 @@ pub fn unified_sim_loop<'a, 'v, 't>(
 ) -> SimResult {
     let control_step = 0.01;
     let sim_steps = (control_step / model.opt().timestep).round() as usize;
-    let max_steps = SAMPLES_PER_ITER;
+    let max_steps = match &task {
+        SimTask::CollectBatch { .. } => SAMPLES_PER_ITER,
+        SimTask::EvaluatePolicy { .. } | SimTask::EstimateProcessNoise => SAMPLES_PER_ITER / 10,
+    };
 
     let mut tracker = SimTracker::default();
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
@@ -623,7 +630,7 @@ fn calculate_discrete_lqr(
         1.0,   // phi_dot penalty
         10.0,  // theta_dot penalty
     ]));
-    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([300.0]));
+    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([1.0]));
 
     // 2. Discretize 4D A and B
     let a_d = SMatrix::<f64, 4, 4>::identity() + a_mat * control_step;
@@ -939,7 +946,7 @@ fn process_step_result<'a>(
                 + 100.0 * theta.powi(2)
                 + 1.0 * phi_dot.powi(2)
                 + 10.0 * theta_dot.powi(2);
-            tracker.total_cost += state_cost + 300.0 * raw_tau.powi(2);
+            tracker.total_cost += state_cost + 30.0 * raw_tau.powi(2);
         }
         SimTask::EstimateProcessNoise => {
             let (pl, pr, t, pdl, pdr, td) = extract_state(data, BACKLASH_JOINTS);
@@ -953,7 +960,7 @@ fn process_step_result<'a>(
             x_k1[3] = td;
 
             if BACKLASH_ESTIMATION {
-                x_k1[4] = x_k1[0] - x_k1[1]; // backlash = phi - theta
+                x_k1[4] = x_k1[0] - x_k1[1]; //Fix not precise backlash = phi - theta
             }
 
             let x_dot_empirical = (x_k1 - x_k) / control_step;
@@ -968,6 +975,7 @@ fn process_step_result<'a>(
     }
     StepAction::Continue
 }
+
 fn finalize_results(task: SimTask, tracker: SimTracker, max_steps: usize) -> SimResult {
     match task {
         SimTask::CollectBatch { .. } => SimResult::Batch(tracker.state_batch),

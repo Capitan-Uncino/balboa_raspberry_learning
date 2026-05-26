@@ -1,20 +1,14 @@
 use crate::file_utils::get_next_file_index;
 use crate::graphic_utils::plot_cost_evolution;
 use crate::learning::lstdq_no_bias_correction::{
-    calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, SAMPLES_PER_ITER,
+    calculate_k, StateAction, ANALYTIC_LQR_POLICY, SAMPLES_PER_ITER,
 };
-use crate::logging_utils::log_progress;
-use mujoco_rs::prelude::*;
-use mujoco_rs::viewer::MjViewer;
-use nalgebra::{SMatrix, SVector};
 use rand::rng;
 use rand::RngExt;
 use rand::SeedableRng;
-use rand_distr::{Distribution, Normal, Uniform};
+use rand_distr::{Distribution, Uniform};
 use std::f64::consts::PI;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 
 const THETA_OU: f64 = 0.30;
 const SIGMA_OU: f64 = 0.10;
@@ -98,7 +92,7 @@ impl LinearRobotSim {
 pub fn collect_full_batch_sim(
     sim: &mut LinearRobotSim,
     log_label: &str,
-    batch_index: usize,
+    _batch_index: usize,
     was_balancing: &mut bool,
     pending_gains: &Arc<Mutex<Option<[f64; 4]>>>,
     active_gains: &mut [f64; 4],
@@ -296,7 +290,7 @@ pub fn run_online_mode_sim(_visualize: bool) -> Result<(), Box<dyn std::error::E
         let pending_clone = Arc::clone(&pending_gains);
 
         // Clone the noise matrix to move it into the thread
-        let noise_cov_clone = noise.1.clone();
+        let _noise_cov_clone = noise.1.clone();
 
         std::thread::spawn(move || {
             let k_to_use = { *k_clone.lock().unwrap() };
@@ -385,7 +379,7 @@ pub fn run_data_collection_mode_sim(_visualize: bool) -> Result<(), Box<dyn std:
 }
 
 pub fn run_sim_plot(
-    visualize: bool,
+    _visualize: bool,
     evaluation_threshold: f64,
     n_policies: usize,
     n_updates: usize,

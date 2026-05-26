@@ -1,5 +1,4 @@
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
-use std::f64::consts::PI;
 
 // Added a 0.0 at the end for the new backlash state
 pub const ANALYTIC_LQR_POLICY: [f64; 5] = [0.18257419, 4.41295298, 0.098522314, 0.44153694, 0.0];
@@ -13,7 +12,7 @@ const DIM_X_AND_U: usize = DIM_X + DIM_U; // 6
 const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2; // (6 * 7) / 2 = 21
 
 // --- LSPI Hyperparameters ---
-const GAMMA: f64 = 1.00; // Discount factor
+const GAMMA: f64 = 0.99; // Discount factor
 pub const SAMPLES_PER_ITER: usize = 100000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
 
@@ -98,7 +97,7 @@ fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f
         10.0,  // theta_dot penalty
         0.0,   // backlash penalty MUST remain 0
     ]));
-    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([300.0]));
+    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([30.0]));
 
     let mut skipped_couples = 0;
     let state_jump_threshold = 2.0;
@@ -204,7 +203,7 @@ pub fn calculate_k(
 ) -> SMatrix<f64, DIM_U, DIM_X> {
     // 1.5 degrees in radians is ~0.026. Multiplying by 40 brings the
     // numerical range to ~1.0, matching the scale of phi and theta.
-    const BACKLASH_SCALE: f64 = 40.0;
+    const BACKLASH_SCALE: f64 = 4.0;
 
     // 1. Scale the dataset for the LSPI solver
     let mut scaled_batch = batch.to_vec();
