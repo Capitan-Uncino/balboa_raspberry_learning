@@ -1,6 +1,8 @@
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
-pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.18257419, 4.41295298, 0.098522314, 0.44153694];
 
+//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.18257419, 4.41295298, 0.098522314, 0.44153694];
+
+pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
 pub const DT: f64 = 0.01;
 
 // --- System Dimensions ---
@@ -10,12 +12,13 @@ const DIM_X_AND_U: usize = DIM_X + DIM_U;
 const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 
 // --- LSPI Hyperparameters ---
-const GAMMA: f64 = 1.00; // Discount factor 0.99
+const GAMMA: f64 = 1.00; // Discount factor
 pub const SAMPLES_PER_ITER: usize = 100000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
 
-//
-//
+// --- NEW: TD(lambda) Hyperparameter ---
+const LAMBDA_TD: f64 = 0.40; // Trace decay factor (0.0 = TD(0), 1.0 = Monte Carlo)
+
 pub fn spectral_radius(
     a_mat: &SMatrix<f64, DIM_X, DIM_X>,
     b_mat: &SMatrix<f64, DIM_X, DIM_U>,
@@ -89,20 +92,23 @@ fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f
     let q_cost = SMatrix::<f64, DIM_X, DIM_X>::from_diagonal(&SVector::from([
         10.0,  // phi penalty
         100.0, // theta penalty
-        1.0,   // phi_dot penalty
-        10.0,  // theta_dot penalty
+        0.0,   // phi_dot penalty
+        0.1,   // theta_dot penalty
     ]));
-    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([300.0]));
+    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([3.0]));
 
     let mut skipped_couples = 0;
     let state_jump_threshold = 2.0;
 
-    // 2. Iterate directly over the raw chronological batch
+    // --- NEW: Initialize the eligibility trace ---
+    let mut z_trace = SVector::<f64, DIM_PARAMS>::zeros();
+
+    // Iterate directly over the raw chronological batch
     for i in 0..(batch.len() - 1) {
         let current = &batch[i];
         let next = &batch[i + 1];
 
-        // Construct mathematical vectors directly from the I2C structs FIRST
+        // Construct mathematical vectors
         let x = SVector::<f64, DIM_X>::from_column_slice(&[
             current.phi,
             current.theta,
@@ -117,12 +123,15 @@ fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f
             next.theta_dot,
         ]);
 
-        // --- NEW: Discontinuity check ---
-        // If the state changes too drastically in one timestep, it implies a reset/fall.
+        // Discontinuity check
         let state_diff_norm = (x - x_next).norm();
         if state_diff_norm > state_jump_threshold {
             skipped_couples += 1;
-            continue; // Skip this transition entirely
+            // --- NEW: Reset trace on jump ---
+            // A discontinuity means the chronological chain is broken.
+            // We must clear the memory so past states aren't blamed for future unrelated costs.
+            z_trace.fill(0.0);
+            continue;
         }
 
         let u = SVector::<f64, DIM_U>::from_column_slice(&[current.u]);
@@ -137,23 +146,26 @@ fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f
         let u_next_greedy = k * x_next;
         let psi_t_plus_1 = get_quadratic_features(&x_next, &u_next_greedy);
 
-        // LSTDQ Update mapping to: phi_t * (phi_t - psi_{t+1} + f)^T
-        //
+        // Temporal difference: phi_t - gamma * psi_{t+1}
         let temporal_diff = phi_t - (GAMMA * psi_t_plus_1);
 
+        // --- NEW: Update the eligibility trace ---
+        // z_t = gamma * lambda * z_{t-1} + phi_t
+        z_trace = z_trace * (GAMMA * LAMBDA_TD) + phi_t;
+
+        // --- NEW: Update A and b matrices using the TRACE (z_trace), not phi_t ---
         for r in 0..DIM_PARAMS {
-            let phi_r = phi_t[r];
-            b_vec[r] += phi_r * cost;
+            let z_r = z_trace[r];
+            b_vec[r] += z_r * cost;
             for c in 0..DIM_PARAMS {
-                a_mat[(r, c)] += phi_r * temporal_diff[c];
+                a_mat[(r, c)] += z_r * temporal_diff[c];
             }
         }
     }
 
-    // --- NEW: Print the results ---
     let total_couples = batch.len().saturating_sub(1);
     println!(
-        "LSTDQ Batch Processing: Skipped {} / {} transitions due to discontinuity.",
+        "LSTDQ(lambda) Batch Processing: Skipped {} / {} transitions due to discontinuity.",
         skipped_couples, total_couples
     );
 

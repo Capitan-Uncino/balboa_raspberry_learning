@@ -1,6 +1,6 @@
 use crate::file_utils::get_next_file_index;
 use crate::graphic_utils::plot_cost_evolution;
-use crate::learning::backlash_estimating_lstdq::{
+use crate::learning::lstdq_lambda::{
     calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, SAMPLES_PER_ITER,
 };
 use crate::logging_utils::log_progress;
@@ -16,11 +16,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const BACKLASH_ESTIMATION: bool = true;
+pub const BACKLASH_ESTIMATION: bool = false;
 const DEADZONE_EPSILON: f64 = 1.5 * std::f64::consts::PI / 180.0;
 
-const THETA_OU: f64 = 0.80;
-const SIGMA_OU: f64 = 0.50;
+const THETA_OU: f64 = 0.60;
+const SIGMA_OU: f64 = 0.30;
 const SEED: u64 = 42;
 const BACKLASH_JOINTS: bool = true;
 const MAX_FALLS: usize = 20;
@@ -311,8 +311,6 @@ pub fn run_sim_plot(
                     "  [!] Policy {} exceeded threshold ({:.4} > {:.4}). Discarding from training.",
                     p_idx, empirical_cost, evaluation_threshold
                 );
-
-                cost_history[p_idx].resize(n_updates + 1, f64::NAN);
                 continue;
             }
 
@@ -340,8 +338,6 @@ pub fn run_sim_plot(
                     "  [!] Batch empty (too many falls or early exit). Discarding policy {}.",
                     p_idx
                 );
-
-                cost_history[p_idx].resize(n_updates + 1, f64::NAN);
                 continue; // Do NOT push to next_active_policies
             }
 
@@ -414,6 +410,7 @@ pub fn run_sim_plot(
 
     Ok(())
 }
+
 // --- 1. CALCULATE ANALYTICAL A AND B MATRICES ---
 /*
 let mw: f64 = 0.0042;
@@ -627,10 +624,10 @@ fn calculate_discrete_lqr(
     let q_cost = SMatrix::<f64, 4, 4>::from_diagonal(&SVector::from([
         10.0,  // phi penalty
         100.0, // theta penalty
-        1.0,   // phi_dot penalty
-        10.0,  // theta_dot penalty
+        0.0,   // phi_dot penalty
+        0.1,   // theta_dot penalty
     ]));
-    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([1.0]));
+    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([3.0]));
 
     // 2. Discretize 4D A and B
     let a_d = SMatrix::<f64, 4, 4>::identity() + a_mat * control_step;
@@ -906,7 +903,7 @@ fn process_step_result<'a>(
                         theta,
                         phi_dot,
                         theta_dot,
-                        backlash, // <--- ADDED HERE
+                        //backlash, // <--- ADDED HERE
                         u: raw_tau,
                     });
                     tracker.loop_counter += 1;
@@ -944,9 +941,9 @@ fn process_step_result<'a>(
             }
             let state_cost = 10.0 * phi.powi(2)
                 + 100.0 * theta.powi(2)
-                + 1.0 * phi_dot.powi(2)
-                + 10.0 * theta_dot.powi(2);
-            tracker.total_cost += state_cost + 30.0 * raw_tau.powi(2);
+                + 0.0 * phi_dot.powi(2)
+                + 0.1 * theta_dot.powi(2);
+            tracker.total_cost += state_cost + 3.0 * raw_tau.powi(2);
         }
         SimTask::EstimateProcessNoise => {
             let (pl, pr, t, pdl, pdr, td) = extract_state(data, BACKLASH_JOINTS);

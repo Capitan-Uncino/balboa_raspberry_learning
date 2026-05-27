@@ -294,7 +294,7 @@ pub fn run_online_mode_sim(_visualize: bool) -> Result<(), Box<dyn std::error::E
 
         std::thread::spawn(move || {
             let k_to_use = { *k_clone.lock().unwrap() };
-            let new_k_mat = calculate_k(batch_to_process, &k_to_use);
+            let new_k_mat = calculate_k(&batch_to_process, &k_to_use);
 
             {
                 *k_clone.lock().unwrap() = new_k_mat;
@@ -462,7 +462,7 @@ pub fn run_sim_plot(
 
             // C) UPDATE PHASE (Synchronous)
             let current_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&policy);
-            let new_k_mat = calculate_k(batch_to_process, &current_k_mat);
+            let new_k_mat = calculate_k(&batch_to_process, &current_k_mat);
 
             policy = [
                 new_k_mat[(0, 0)],

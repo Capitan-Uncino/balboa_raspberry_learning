@@ -46,7 +46,7 @@ pub fn run_offline_computation_mode() -> Result<(), Box<dyn Error>> {
         nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(ANALYTIC_LQR_POLICY.as_slice());
 
     // Call the computation algorithm
-    let new_k_mat = calculate_k(batch, &initial_k_mat);
+    let new_k_mat = calculate_k(&batch, &initial_k_mat);
 
     println!("========================================");
     println!(">>> COMPUTED K MATRIX RESULT <<<");

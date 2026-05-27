@@ -20,7 +20,7 @@ use std::error::Error;
 use sim::mujoco_sim::{run_data_collection_mode_sim, run_online_mode_sim, run_sim_plot};
 
 const ONLINE: bool = true;
-const NEW_BATCH: bool = true;
+const NEW_BATCH: bool = false;
 const SIM: bool = true;
 const VISUALIZE: bool = false;
 const PLOT: bool = true;
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             #[cfg(feature = "sim")]
             {
                 if PLOT {
-                    run_sim_plot(VISUALIZE, 10.0, 5, 3, 0.2)?;
+                    run_sim_plot(VISUALIZE, 15.0, 5, 2, 0.5)?;
                 } else {
                     run_online_mode_sim(VISUALIZE)?;
                 }
