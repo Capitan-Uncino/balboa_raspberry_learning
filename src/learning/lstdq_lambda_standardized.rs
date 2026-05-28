@@ -4,9 +4,9 @@ pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
 pub const DT: f64 = 0.01;
 
 // --- OPTIONAL FEATURE CONSTANTS ---
-pub const STANDARDIZATION: bool = false;
-pub const OUTLIERS_REMOVAL: bool = false;
-pub const LS_REGULARIZATION: bool = false;
+pub const STANDARDIZATION: bool = true;
+pub const OUTLIERS_REMOVAL: bool = true;
+pub const LS_REGULARIZATION: bool = true;
 
 // --- System Dimensions ---
 pub const DIM_X: usize = 4;
@@ -17,7 +17,7 @@ const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 // --- LSPI Hyperparameters ---
 const GAMMA: f64 = 1.00; // Discount factor
 pub const SAMPLES_PER_ITER: usize = 100000; // Samples per policy evaluation
-const LAMBDA_REG: f64 = 1e-5; // L2 Regularization
+const LAMBDA_REG: f64 = 1e-5; // Regularization
 const LAMBDA_TD: f64 = 0.40; // Trace decay factor
 
 pub fn spectral_radius(

@@ -1,6 +1,6 @@
 use crate::file_utils::get_next_file_index;
 use crate::graphic_utils::plot_cost_evolution;
-use crate::learning::lstdq_lambda::{
+use crate::learning::lstdq_lambda_standardized::{
     calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, SAMPLES_PER_ITER,
 };
 use crate::logging_utils::log_progress;
