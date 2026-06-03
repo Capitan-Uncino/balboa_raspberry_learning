@@ -1,6 +1,6 @@
 use crate::file_utils::get_next_file_index;
 use crate::graphic_utils::plot_cost_evolution;
-use crate::learning::lstdq_lambda_standardized::{
+use crate::learning::lstdq_lambda_standardized_polyak::{
     calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, SAMPLES_PER_ITER,
 };
 use crate::logging_utils::log_progress;
@@ -807,6 +807,8 @@ fn apply_motor_physics<'a>(
     let pwm_resolution = 400.0;
     let max_speed = 47.5;
 
+    let gaussian_noise = 0.0;
+
     // 1. OU Noise
     if enable_noise {
         let u1: f64 = rng.random_range(0.0001..1.0);
@@ -814,6 +816,14 @@ fn apply_motor_physics<'a>(
         let epsilon = (-2.0f64 * u1.ln()).sqrt() * (2.0f64 * PI * u2).cos();
         let dt: f64 = 0.01;
         let dx = THETA_OU * (-*last_noise) * dt + SIGMA_OU * epsilon * dt.sqrt();
+
+        // Standard deviation of the exact discrete series
+        let discrete_variance = (SIGMA_OU * SIGMA_OU) / (2.0 * THETA_OU - THETA_OU * THETA_OU * dt);
+        let exact_std_dev = discrete_variance.sqrt();
+
+        // The resulting Gaussian noise
+        let gaussian_noise = exact_std_dev * epsilon;
+
         *last_noise += dx;
     } else {
         *last_noise = 0.0;
