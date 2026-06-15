@@ -1,263 +1,540 @@
 use crate::file_utils::get_next_file_index;
-use crate::learning::lstdq::{calculate_k, StateAction, ANALYTIC_LQR_POLICY, SAMPLES_PER_ITER};
+use crate::learning::lstdq_lambda_standardized_polyak::{
+    calculate_k, StateAction, ANALYTIC_LQR_POLICY, SAMPLES_PER_ITER,
+};
 use crate::logging_utils::log_progress;
-use rppal::gpio::{Gpio, Trigger};
 use rppal::i2c::I2c;
 use std::error::Error;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
-use rand::Rng;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// ==========================================
-// 1. NOISE GENERATOR (Ported from C++)
-// ==========================================
-pub struct NoiseGenerator {
-    last_noise: f64,
-    theta_ou: f64,
-    sigma_ou: f64,
+// --- I2C ADDRESSES ---
+const ARDUINO_ADDR: u16 = 0x08;
+const LSM6_ADDR: u16 = 0x6B;
+
+// IMU Control Registers
+const LSM6_CTRL1_XL: u8 = 0x10; // Accelerometer Control
+const LSM6_CTRL2_G: u8 = 0x11; // Gyroscope Control
+
+// IMU Data Registers
+const LSM6_OUTX_L_XL: u8 = 0x28; //  Accel X
+const LSM6_OUTY_L_G: u8 = 0x24; // Gyro Y
+const LSM6_OUTZ_L_XL: u8 = 0x2C; // Accel Z
+const LSM6_OUTY_L_XL: u8 = 0x2A; // Accel Y
+                                 //
+                                 //
+
+const STOP_TILT_RAD: f64 = 60.0 / RAD2DEG;
+const START_TILT_RAD: f64 = 20.0 / RAD2DEG;
+
+// --- EXACT PHYSICAL CONSTANTS ---
+const CALIBRATION_ITERATIONS: i32 = 100;
+const TICKS_RADIAN: f64 = 161.0; // 12 * 51.45 * 41 / 25
+const BITS: f64 = 29000.0; // ±32768.0 -> 2**15 equivalent scalar
+const DPS: f64 = 1000.0;
+const RAD2DEG: f64 = 57.296; // 180 / pi
+const K_LATERAL: f64 = 0.5; // Converted to radians for internal math
+
+const DEBUG: bool = true;
+
+// --- LOGGING HELPER ---
+fn system_log(log_file: &Arc<Mutex<File>>, level: &str, msg: &str) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let log_line = format!("[{:.3}] [{}] {}", timestamp, level, msg);
+
+    // Print to console
+    if level == "ERROR" || level == "FATAL" {
+        eprintln!("{}", log_line);
+    } else {
+        println!("{}", log_line);
+    }
+
+    // Append to file
+    //if let Ok(mut file) = log_file.lock() {
+    //    let _ = writeln!(file, "{}", log_line);
+    //    let _ = file.flush(); // Ensure it writes immediately in case of power loss
+    //}
 }
 
-impl NoiseGenerator {
-    pub fn new() -> Self {
-        Self {
-            last_noise: 0.0,
-            theta_ou: 0.30,
-            sigma_ou: 0.80,
-        }
-    }
+// --- DATA PIPELINE STRUCTS ---
 
-    fn generate_gaussian(&self) -> f64 {
-        let mut rng = rand::thread_rng();
-        let u1: f64 = rng.gen_range(0.0001..=1.0);
-        let u2: f64 = rng.gen_range(0.0..=1.0);
-        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
-    }
+pub struct RawMeasurements {
+    // Memory (Persists across loops)
+    pub g_y_zero: i32,
+    pub last_time: Instant,
+    pub last_encoder_left: i32,
+    pub last_encoder_right: i32,
+    pub encoder_left_zero: i32,
+    pub encoder_right_zero: i32,
 
-    pub fn generate_exploration_noise(&mut self) -> f64 {
-        let epsilon = self.generate_gaussian();
-        let dx = self.theta_ou * (-self.last_noise) * 0.01 + self.sigma_ou * epsilon * 0.1;
-        self.last_noise += dx;
-        self.last_noise
-    }
+    // Current Tick Data
+    pub g_y_raw: i16,
+    pub encoder_left: i32,
+    pub encoder_right: i32,
+    pub battery_mv: u16,
+    pub dt: f64,
 }
 
-// ==========================================
-// 2. STATE TRACKER
-// ==========================================
-pub struct RobotState {
+#[derive(Debug)]
+pub struct ProcessedState {
+    // Controller Memory (Persists across loops)
+    pub last_direction_forward: bool,
+    pub last_oscillation_time: Instant,
+
+    // Current Tick Physics
     pub phi: f64,
     pub phi_dot: f64,
-    pub phi_dif: f64,
     pub theta: f64,
     pub theta_dot: f64,
-    last_counts_left: f64,
-    last_counts_right: f64,
+    pub phi_diff: f64,
+    pub battery_mv: u16,
 }
 
-impl RobotState {
-    pub fn new() -> Self {
-        Self {
-            phi: 0.0, phi_dot: 0.0, phi_dif: 0.0,
-            theta: 0.0, theta_dot: 0.0,
-            last_counts_left: 0.0, last_counts_right: 0.0,
+// --- IMU HELPER FUNCTIONS ---
+
+fn init_and_calibrate_imu(
+    i2c_bus: &Arc<Mutex<I2c>>,
+    log_file: &Arc<Mutex<File>>,
+) -> Result<(RawMeasurements, ProcessedState), Box<dyn Error>> {
+    let mut bus = i2c_bus.lock().unwrap();
+
+    bus.set_slave_address(LSM6_ADDR)?;
+
+    // 1. Turn on the Gyro (208 Hz, 1000 deg/s)
+    bus.write(&[LSM6_CTRL2_G, 0b01011000])?;
+
+    // 2. Turn on the Accelerometer (208 Hz, ±2g)
+    bus.write(&[LSM6_CTRL1_XL, 0b01010000])?;
+
+    thread::sleep(Duration::from_millis(500));
+
+    system_log(
+        log_file,
+        "INFO",
+        "Calibrating IMU (Do not touch the robot)...",
+    );
+
+    let mut total_g_y: i64 = 0;
+    let mut total_accel_x: i64 = 0;
+    let mut total_accel_y: i64 = 0; // <-- Added Y
+    let mut total_accel_z: i64 = 0;
+
+    for _ in 0..CALIBRATION_ITERATIONS {
+        let mut buf_gy = [0u8; 2];
+        let mut buf_ax = [0u8; 2];
+        let mut buf_ay = [0u8; 2]; // <-- Added Y
+        let mut buf_az = [0u8; 2];
+
+        // Read Gyro Y
+        bus.write_read(&[LSM6_OUTY_L_G], &mut buf_gy)?;
+        total_g_y += i16::from_le_bytes(buf_gy) as i64;
+
+        // Read Accel X, Y & Z
+        bus.write_read(&[LSM6_OUTX_L_XL], &mut buf_ax)?;
+        bus.write_read(&[LSM6_OUTY_L_XL], &mut buf_ay)?; // <-- Added Y
+        bus.write_read(&[LSM6_OUTZ_L_XL], &mut buf_az)?;
+
+        total_accel_x += i16::from_le_bytes(buf_ax) as i64;
+        total_accel_y += i16::from_le_bytes(buf_ay) as i64; // <-- Added Y
+        total_accel_z += i16::from_le_bytes(buf_az) as i64;
+
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // Averages
+    let g_y_zero = (total_g_y / CALIBRATION_ITERATIONS as i64) as i32;
+    let avg_accel_x = (total_accel_x / CALIBRATION_ITERATIONS as i64) as f64;
+    let avg_accel_y = (total_accel_y / CALIBRATION_ITERATIONS as i64) as f64; // <-- Added Y
+    let avg_accel_z = (total_accel_z / CALIBRATION_ITERATIONS as i64) as f64;
+
+    // Log the raw values
+    system_log(
+        log_file,
+        "DEBUG",
+        &format!(
+            "Raw Gravity - X: {}, Y: {}, Z: {}",
+            avg_accel_x, avg_accel_y, avg_accel_z
+        ),
+    );
+
+    let initial_theta = f64::atan2(avg_accel_z, avg_accel_x);
+
+    system_log(
+        log_file,
+        "SUCCESS",
+        &format!(
+            "Calibration complete. Initial Angle: {:.2} degrees",
+            initial_theta * RAD2DEG
+        ),
+    );
+
+    let raw = RawMeasurements {
+        g_y_zero: (total_g_y / CALIBRATION_ITERATIONS as i64) as i32,
+        last_time: Instant::now(),
+        last_encoder_left: 0,
+        last_encoder_right: 0,
+        encoder_left_zero: 0,
+        encoder_right_zero: 0,
+        g_y_raw: 0,
+        encoder_left: 0,
+        encoder_right: 0,
+        battery_mv: 0,
+        dt: 0.0,
+    };
+
+    let processed = ProcessedState {
+        last_direction_forward: true,
+        last_oscillation_time: Instant::now(),
+        phi: 0.0,
+        phi_dot: 0.0,
+        theta: initial_theta,
+        theta_dot: 0.0,
+        phi_diff: 0.0,
+        battery_mv: 0,
+    };
+
+    Ok((raw, processed))
+}
+
+// --- HARDWARE & MATH LOGIC ---
+
+fn gather_raw_state(i2c_bus: &Arc<Mutex<I2c>>, raw: &mut RawMeasurements) -> bool {
+    let mut bus = match i2c_bus.lock() {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+
+    // 1. Time Delta
+    let now = Instant::now();
+    raw.dt = now.duration_since(raw.last_time).as_secs_f64();
+    raw.last_time = now;
+
+    // 2. Gyro Read & Integration
+    raw.g_y_raw = raw.g_y_zero as i16; // Fallback
+    if bus.set_slave_address(LSM6_ADDR).is_ok() {
+        let mut buf = [0u8; 2];
+        if bus.write_read(&[LSM6_OUTY_L_G], &mut buf).is_ok() {
+            raw.g_y_raw = i16::from_le_bytes(buf);
         }
     }
 
-    pub fn update_encoders(&mut self, enc_left: i32, enc_right: i32, dt_ms: f64) {
-        let ticks_radian = 161.0;
-        let counts_left = (enc_left as f64) / ticks_radian;
-        let counts_right = (enc_right as f64) / ticks_radian;
-
-        let phi_dot_left = (counts_left - self.last_counts_left) * 1000.0 / dt_ms;
-        let phi_dot_right = (counts_right - self.last_counts_right) * 1000.0 / dt_ms;
-
-        self.phi += (counts_left - self.last_counts_left + counts_right - self.last_counts_right) / 2.0;
-        self.phi_dif = counts_left - counts_right;
-        self.phi_dot = (phi_dot_left + phi_dot_right) / 2.0;
-
-        self.last_counts_left = counts_left;
-        self.last_counts_right = counts_right;
+    // 3. Telemetry Read
+    if bus.set_slave_address(ARDUINO_ADDR).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 10];
+    if bus.read(&mut buf).is_err() {
+        return false;
     }
 
-    // Call this if you are calculating theta natively by reading the IMU in Rust
-    pub fn update_gyro(&mut self, gyro_rate: f64, dt_ms: f64) {
-        self.theta_dot = gyro_rate;
-        self.theta += self.theta_dot * dt_ms / 1000.0;
+    raw.encoder_left = i32::from_le_bytes(buf[0..4].try_into().unwrap());
+    raw.encoder_right = i32::from_le_bytes(buf[4..8].try_into().unwrap());
+    raw.battery_mv = u16::from_le_bytes(buf[8..10].try_into().unwrap());
+
+    true
+}
+
+fn process_measurements(raw: &RawMeasurements, old_state: &ProcessedState) -> ProcessedState {
+    // 1. Calculate physics
+    let theta_dot = (raw.g_y_raw as f64 - raw.g_y_zero as f64) / BITS * DPS / RAD2DEG;
+    let mut theta = old_state.theta + theta_dot * raw.dt;
+    if theta.abs() < STOP_TILT_RAD {
+        theta *= 0.999
+    }
+
+    let phi_left = (raw.encoder_left - raw.encoder_left_zero) as f64 / TICKS_RADIAN;
+    let phi_right = (raw.encoder_right - raw.encoder_right_zero) as f64 / TICKS_RADIAN;
+
+    let phi = (phi_left + phi_right) / 2.0;
+    let phi_dot = ((raw.encoder_left - raw.last_encoder_left) as f64 / TICKS_RADIAN / raw.dt
+        + (raw.encoder_right - raw.last_encoder_right) as f64 / TICKS_RADIAN / raw.dt)
+        / 2.0;
+
+    // 2. Return the new state, carrying forward the persistence
+    ProcessedState {
+        // Carry forward persistence
+        last_direction_forward: old_state.last_direction_forward,
+        last_oscillation_time: old_state.last_oscillation_time,
+
+        // Update with fresh physics
+        phi,
+        phi_dot,
+        theta,
+        theta_dot,
+        phi_diff: phi_left - phi_right,
+        battery_mv: raw.battery_mv,
     }
 }
 
-// ==========================================
-// 3. CORE CONTROL LOOP
-// ==========================================
-fn collect_full_batch(
+fn compute_control_action(
+    state: &mut ProcessedState,
+    current_k: &Arc<Mutex<nalgebra::SMatrix<f64, 1, 4>>>,
+    was_balancing: &bool,
+    avoid_oscillations: bool,
+) -> (f64, i16, i16) {
+    if !was_balancing {
+        return (0.0, 0, 0);
+    }
+
+    let u_physical = {
+        let k = current_k.lock().unwrap();
+        k[(0, 0)] * state.phi
+            + k[(0, 1)] * state.theta
+            + k[(0, 2)] * state.phi_dot
+            + k[(0, 3)] * state.theta_dot
+    };
+
+    let u_left = u_physical - (state.phi_diff * K_LATERAL);
+    let u_right = u_physical + (state.phi_diff * K_LATERAL);
+
+    let mut v_batt = state.battery_mv as f64 / 1000.0;
+    if v_batt < 1.0 {
+        v_batt = 7.4;
+    }
+
+    let mut pwm_left = ((400.0 / v_batt) * u_left).clamp(-400.0, 400.0) as i16;
+    let mut pwm_right = ((400.0 / v_batt) * u_right).clamp(-400.0, 400.0) as i16;
+
+    if avoid_oscillations {
+        let present_forward = u_physical >= 0.0;
+        if present_forward != state.last_direction_forward {
+            let now = Instant::now();
+            if now.duration_since(state.last_oscillation_time).as_millis() < 100 {
+                return (0.0, 0, 0);
+            } else {
+                state.last_oscillation_time = now;
+                state.last_direction_forward = present_forward;
+            }
+        }
+    }
+
+    (u_physical, pwm_left, pwm_right)
+}
+
+fn write_commands(
+    i2c_bus: &Arc<Mutex<I2c>>,
+    left_speed: i16,
+    right_speed: i16,
+    log_file: &Arc<Mutex<File>>,
+) {
+    let mut write_buf = [0u8; 4];
+    write_buf[0..2].copy_from_slice(&left_speed.to_le_bytes());
+    write_buf[2..4].copy_from_slice(&right_speed.to_le_bytes());
+
+    if let Ok(mut bus) = i2c_bus.lock() {
+        let _ = bus.set_slave_address(ARDUINO_ADDR);
+        if let Err(e) = bus.write(&write_buf) {
+            system_log(
+                log_file,
+                "ERROR",
+                &format!("I2C Write Motor Command Error: {:?}", e),
+            );
+        }
+    }
+}
+
+// --- MAIN ORCHESTRATOR ---
+
+pub fn collect_full_batch(
     i2c_bus: &Arc<Mutex<I2c>>,
     log_label: &str,
     batch_index: usize,
     was_balancing: &mut bool,
-    pending_gains: &Arc<Mutex<Option<[f32; 4]>>>,
-    current_gains: &mut [f32; 4],
-    state: &mut RobotState,
-    noise_gen: &mut NoiseGenerator,
+    current_k: &Arc<Mutex<nalgebra::SMatrix<f64, 1, 4>>>,
+    log_file: &Arc<Mutex<File>>,
+    raw: &mut RawMeasurements,
+    state: &mut ProcessedState,
 ) -> Vec<StateAction> {
     let mut state_batch = Vec::with_capacity(SAMPLES_PER_ITER);
     let mut loop_counter = 0;
-
-    let gpio = Gpio::new().expect("Failed to initialize GPIO");
-    let mut sync_pin = gpio.get(22).expect("GPIO 22 busy").into_input();
-    sync_pin.set_interrupt(Trigger::RisingEdge, None).expect("Failed to set interrupt");
-
     let mut stability_counter = 0;
     let stability_threshold = 10;
-    let stop_angle_rad = 60.0_f64.to_radians();
-    let dt_ms = 10.0; // 10ms loop time
+    let mut i2c_error_state = false;
 
-    println!(">>> Syncing with Hardware Clock...");
+    if gather_raw_state(i2c_bus, raw) {
+        raw.last_encoder_left = raw.encoder_left;
+        raw.last_encoder_right = raw.encoder_right;
+        raw.encoder_left_zero = raw.encoder_left;
+        raw.encoder_right_zero = raw.encoder_right;
+        raw.last_time = Instant::now();
+    }
+
+    let mut iteration_count = 0;
 
     while state_batch.len() < SAMPLES_PER_ITER {
-        let _ = sync_pin.poll_interrupt(true, Some(Duration::from_millis(15)));
-
-        if sync_pin.is_low() {
-            continue;
-        }
-
-        // 1. UPDATE GAINS LOCALLY (If background thread finished)
-        if let Some(new_gains) = pending_gains.lock().unwrap().take() {
-            *current_gains = new_gains;
-        }
-
-        let mut telemetry_buf = [0u8; 10];
-        let mut is_read_successful = false;
-
-        {
-            let mut bus = i2c_bus.lock().unwrap();
-            
-            // 2. READ ENCODERS & BATTERY FROM BALBOA (Address 0x08)
-            let _ = bus.set_slave_address(0x08);
-            if bus.read(&mut telemetry_buf).is_ok() {
-                is_read_successful = true;
+        iteration_count += 1;
+        // 1. GATHER
+        if gather_raw_state(i2c_bus, raw) {
+            if i2c_error_state {
+                system_log(log_file, "SUCCESS", "Hardware I2C Connection Restored");
+                i2c_error_state = false;
             }
 
-            // 3. READ IMU (Address 0x6B)
-            // (Assuming you have implemented LSM6 I2C reads here)
-            // let _ = bus.set_slave_address(0x6B);
-            // let gyro_rate = ... read from LSM6 ...
-            // state.update_gyro(gyro_rate, dt_ms);
-            
-            // MOCK GYRO FOR NOW (Replace with actual IMU read)
-            state.update_gyro(0.0, dt_ms); 
-        }
+            // 2. PROCESS
+            // Create a new tick state, carrying over memory from the persistent ProcessedState
+            let mut current_state = process_measurements(raw, state);
 
-        if is_read_successful {
-            // Parse Telemetry
-            let enc_left = i32::from_le_bytes(telemetry_buf[0..4].try_into().unwrap());
-            let enc_right = i32::from_le_bytes(telemetry_buf[4..8].try_into().unwrap());
-            let battery_mv = u16::from_le_bytes(telemetry_buf[8..10].try_into().unwrap());
+            if DEBUG && iteration_count % 1000 == 1 {
+                println!("[DEBUG] current state {:?}", current_state);
+            }
 
-            state.update_encoders(enc_left, enc_right, dt_ms);
+            // 3. COMPUTE CONTROL
+            // Returns (Average Physical U, PWM Left, PWM Right)
+            let (u_avg, speed_left, speed_right) =
+                compute_control_action(&mut current_state, current_k, was_balancing, true);
 
-            // 4. CALCULATE CONTROL EFFORT (Policy + Noise)
-            let u_raw = current_gains[0] as f64 * state.phi + 
-                        current_gains[1] as f64 * state.theta + 
-                        (current_gains[2] as f64 + 0.19) * state.phi_dot + 
-                        current_gains[3] as f64 * state.theta_dot;
+            // 4. ACTUATE
+            write_commands(i2c_bus, speed_left, speed_right, log_file);
 
-            let noise = noise_gen.generate_exploration_noise();
-            let u_noisy = u_raw + noise;
-
-            // 5. CALCULATE PHYSICAL MOTOR COMMANDS
-            let mut u_physical = u_noisy;
-            let offset = 0.45;
-            if state.phi_dot > 0.0 { u_physical += offset; } else { u_physical -= offset; }
-
-            let actual_voltage = (battery_mv as f64 / 1000.0).max(5.0);
-            let base_speed = (400.0 / actual_voltage) * u_physical;
-
-            let distance_diff_response = 80.0;
-            let left_speed = (base_speed - state.phi_dif * distance_diff_response).clamp(-400.0, 400.0) as i16;
-            let right_speed = (base_speed + state.phi_dif * distance_diff_response).clamp(-400.0, 400.0) as i16;
-
-            // 6. WRITE MOTOR COMMANDS TO BALBOA (Address 0x08)
-            write_motor_commands(i2c_bus, left_speed, right_speed);
-
-            // 7. RECORD DATA
-            let data = StateAction {
-                phi: state.phi,
-                theta: state.theta,
-                phi_dot: state.phi_dot,
-                theta_dot: state.theta_dot,
-                u: u_noisy,
-            };
-
-            let is_sane = data.theta.is_finite() && data.theta_dot.abs() < 100.0;
-            let is_upright = data.theta.abs() < stop_angle_rad;
-
-            if is_sane && is_upright {
+            // 5. STABILITY & LOGGING
+            if current_state.theta.abs() < START_TILT_RAD {
                 stability_counter += 1;
+
                 if stability_counter >= stability_threshold {
                     if !*was_balancing {
-                        println!(">>> ROBOT STANDING: Resuming {}...", log_label);
+                        system_log(
+                            log_file,
+                            "STATE",
+                            &format!("ROBOT STANDING: Resuming {}...", log_label),
+                        );
                         *was_balancing = true;
+
+                        // Reset positional drift on the raw measurement tracker
+                        current_state.theta = 0.0;
+                        current_state.phi = 0.0;
+                        if gather_raw_state(i2c_bus, raw) {
+                            raw.last_encoder_left = raw.encoder_left;
+                            raw.last_encoder_right = raw.encoder_right;
+                            raw.encoder_left_zero = raw.encoder_left;
+                            raw.encoder_right_zero = raw.encoder_right;
+                            raw.last_time = Instant::now();
+                        }
                     }
 
-                    state_batch.push(data);
-                    loop_counter += 1;
+                    // Log the snapshot
+                    state_batch.push(StateAction {
+                        phi: current_state.phi,
+                        theta: current_state.theta,
+                        phi_dot: current_state.phi_dot,
+                        theta_dot: current_state.theta_dot,
+                        u: u_avg,
+                    });
 
+                    loop_counter += 1;
                     if loop_counter >= 100 {
                         log_progress(state_batch.len(), SAMPLES_PER_ITER, batch_index, log_label);
                         loop_counter = 0;
                     }
                 }
-            } else {
+            } else if current_state.theta.abs() > STOP_TILT_RAD {
                 stability_counter = 0;
                 if *was_balancing {
-                    println!("<<< ROBOT FELL: Pausing {}", log_label);
+                    system_log(
+                        log_file,
+                        "WARN",
+                        &format!("ROBOT FELL: Pausing {}...", log_label),
+                    );
                     *was_balancing = false;
                 }
             }
+
+            // 6. UPDATE HISTORY for next tick's derivatives
+            raw.last_encoder_left = raw.encoder_left;
+            raw.last_encoder_right = raw.encoder_right;
+
+            *state = current_state;
         } else {
+            // Failsafe if I2C fails
             stability_counter = 0;
+            if !i2c_error_state {
+                system_log(
+                    log_file,
+                    "ERROR",
+                    "Hardware Read Failed (Suppressing log until restored)",
+                );
+                i2c_error_state = true;
+            }
         }
+
+        thread::sleep(Duration::from_millis(10));
     }
 
-    let _ = sync_pin.clear_interrupt();
+    system_log(
+        log_file,
+        "SUCCESS",
+        &format!("Completed Batch {} for {}", batch_index, log_label),
+    );
     state_batch
 }
 
-fn write_motor_commands(i2c_bus: &Arc<Mutex<I2c>>, left: i16, right: i16) {
-    let mut write_buf = Vec::with_capacity(4);
-    write_buf.extend_from_slice(&left.to_le_bytes());
-    write_buf.extend_from_slice(&right.to_le_bytes());
+// Helper function that blocks and retries until the robot is physically powered on and answering
+fn connect_i2c_with_retry(log_file: &Arc<Mutex<File>>) -> Arc<Mutex<I2c>> {
+    system_log(log_file, "INFO", "Waiting for Robot I2C connection...");
 
-    if let Ok(mut i2c) = i2c_bus.lock() {
-        let _ = i2c.set_slave_address(0x08);
-        if let Err(e) = i2c.write(&write_buf) {
-            eprintln!("I2C Write Error: {:?}", e);
+    loop {
+        match I2c::new() {
+            Ok(mut i2c) => {
+                if let Ok(_) = i2c.set_slave_address(0x08) {
+                    // 0x08 is ARDUINO_ADDR
+                    // PING: Try reading 1 byte to verify the Arduino is actually powered on
+                    let mut buf = [0u8; 1];
+                    if i2c.read(&mut buf).is_ok() {
+                        system_log(
+                            log_file,
+                            "SUCCESS",
+                            "I2C connection established and Robot is ONLINE.",
+                        );
+                        return Arc::new(Mutex::new(i2c));
+                    } else {
+                        system_log(log_file, "WARN", "I2C open, but Robot did not respond (Is it powered on?). Retrying in 3s...");
+                    }
+                } else {
+                    system_log(
+                        log_file,
+                        "WARN",
+                        "Failed to set I2C address. Retrying in 3s...",
+                    );
+                }
+            }
+            Err(e) => {
+                system_log(
+                    log_file,
+                    "WARN",
+                    &format!("Failed to init I2C bus ({}). Retrying in 3s...", e),
+                );
+            }
         }
+        thread::sleep(Duration::from_secs(3));
     }
 }
 
 pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
-    let mut i2c = I2c::new().map_err(|e| format!("Failed to init I2C: {}", e))?;
-    let i2c_bus = Arc::new(Mutex::new(i2c));
+    let log_target = Arc::new(Mutex::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("robot_system.log")?,
+    ));
+
+    system_log(&log_target, "START", "=== INIT ONLINE MODE ===");
+    let i2c_bus = connect_i2c_with_retry(&log_target);
+
+    // ✨ CALIBRATE ONCE HERE
+    let (mut measures, mut state) = init_and_calibrate_imu(&i2c_bus, &log_target)?;
 
     let initial_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&ANALYTIC_LQR_POLICY);
     let current_k = Arc::new(Mutex::new(initial_k_mat));
-    let pending_gains: Arc<Mutex<Option<[f32; 4]>>> = Arc::new(Mutex::new(None));
 
-    let mut current_gains = [
-        initial_k_mat[(0, 0)] as f32, initial_k_mat[(0, 1)] as f32,
-        initial_k_mat[(0, 2)] as f32, initial_k_mat[(0, 3)] as f32,
-    ];
-
-    let mut state = RobotState::new();
-    let mut noise_gen = NoiseGenerator::new();
     let mut computations_completed = 0;
     let mut was_balancing = false;
 
-    println!("Starting 100Hz I2C control loop...");
+    system_log(&log_target, "INFO", "Starting 100Hz I2C control loop...");
 
     loop {
         let batch_to_process = collect_full_batch(
@@ -265,70 +542,117 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
             "LSTDQ Batch",
             computations_completed,
             &mut was_balancing,
-            &pending_gains,
-            &mut current_gains,
+            &current_k,
+            &log_target,
+            &mut measures,
             &mut state,
-            &mut noise_gen,
         );
 
         computations_completed += 1;
         let k_clone = Arc::clone(&current_k);
-        let pending_clone = Arc::clone(&pending_gains);
+        let log_clone = Arc::clone(&log_target);
 
         thread::spawn(move || {
+            if let Some(core_ids) = core_affinity::get_core_ids() {
+                if core_ids.len() > 2 {
+                    core_affinity::set_for_current(core_ids[2]);
+                }
+            }
+
             let k_to_use = { *k_clone.lock().unwrap() };
-            let new_k_mat = calculate_k(batch_to_process, &k_to_use);
+            let new_k_mat = calculate_k(&batch_to_process, &k_to_use);
 
-            { *k_clone.lock().unwrap() = new_k_mat; }
+            {
+                *k_clone.lock().unwrap() = new_k_mat;
+            }
 
-            let new_k_array = [
-                new_k_mat[(0, 0)] as f32, new_k_mat[(0, 1)] as f32,
-                new_k_mat[(0, 2)] as f32, new_k_mat[(0, 3)] as f32,
-            ];
-
-            *pending_clone.lock().unwrap() = Some(new_k_array);
-            println!(">>> LSTDQ Update: New K vector queued for next I2C window.");
+            system_log(&log_clone, "UPDATE", "LSTDQ: New K matrix applied.");
         });
     }
 }
 
 pub fn run_data_collection_mode() -> Result<(), Box<dyn Error>> {
-    let mut i2c = I2c::new().map_err(|e| format!("Failed to init I2C: {}", e))?;
-    let i2c_bus = Arc::new(Mutex::new(i2c));
+    let log_target = Arc::new(Mutex::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("robot_system.log")?,
+    ));
 
-    let mut file_index = get_next_file_index();
+    system_log(&log_target, "START", "=== INIT DATA COLLECTION MODE ===");
+    let i2c_bus = connect_i2c_with_retry(&log_target);
+
+    // ✨ CALIBRATE ONCE HERE
+    let (mut measures, mut state) = init_and_calibrate_imu(&i2c_bus, &log_target)?;
+
+    let file_index = get_next_file_index();
+    let mut current_file_index = file_index;
     let mut was_balancing = false;
     let data_dir = "collected_data";
-    
-    let dummy_pending_gains: Arc<Mutex<Option<[f32; 4]>>> = Arc::new(Mutex::new(None));
-    let mut initial_gains = [0.182, 4.412, 0.098, 0.441]; // Fallback safe values
 
-    let mut state = RobotState::new();
-    let mut noise_gen = NoiseGenerator::new();
+    let dummy_k = Arc::new(Mutex::new(nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(
+        &ANALYTIC_LQR_POLICY,
+    )));
 
-    println!("Started data collection mode. Will start at index: {}", file_index);
+    system_log(
+        &log_target,
+        "INFO",
+        &format!(
+            "Started data collection. Start index: {}",
+            current_file_index
+        ),
+    );
 
     loop {
         let batch_to_process = collect_full_batch(
             &i2c_bus,
-            "CSV Collection",
-            file_index,
+            "LSTDQ Batch",
+            current_file_index,
             &mut was_balancing,
-            &dummy_pending_gains,
-            &mut initial_gains,
+            &dummy_k,
+            &log_target,
+            &mut measures,
             &mut state,
-            &mut noise_gen,
         );
 
-        let filename = format!("{}/batch_{}.csv", data_dir, file_index);
-        let mut file = File::create(&filename)?;
+        let filename = format!("{}/batch_{}.csv", data_dir, current_file_index);
+        let mut file = match File::create(&filename) {
+            Ok(f) => f,
+            Err(e) => {
+                system_log(
+                    &log_target,
+                    "ERROR",
+                    &format!("Failed to create CSV {}: {:?}", filename, e),
+                );
+                continue;
+            }
+        };
 
-        writeln!(file, "phi,phi_dot,theta,theta_dot,u")?;
-        for s in &batch_to_process {
-            writeln!(file, "{},{},{},{},{}", s.phi, s.theta, s.phi_dot, s.theta_dot, s.u)?;
+        if let Err(e) = writeln!(file, "phi,phi_dot,theta,theta_dot,u") {
+            system_log(
+                &log_target,
+                "ERROR",
+                &format!("Failed to write CSV Headers: {:?}", e),
+            );
         }
 
-        println!(">>> Saved batch of size {} to {} (Next: {})", SAMPLES_PER_ITER, filename, file_index + 1);
-        file_index += 1;
+        for s in &batch_to_process {
+            let _ = writeln!(
+                file,
+                "{},{},{},{},{}",
+                s.phi, s.theta, s.phi_dot, s.theta_dot, s.u
+            );
+        }
+
+        system_log(
+            &log_target,
+            "SUCCESS",
+            &format!(
+                "Saved batch to {} (Next: {})",
+                filename,
+                current_file_index + 1
+            ),
+        );
+        current_file_index += 1;
     }
 }

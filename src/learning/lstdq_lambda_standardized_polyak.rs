@@ -1,6 +1,7 @@
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 
-pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
+//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
+pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
 pub const DT: f64 = 0.01;
 
 // --- OPTIONAL FEATURE CONSTANTS ---
@@ -16,7 +17,7 @@ const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 
 // --- LSPI Hyperparameters ---
 const GAMMA: f64 = 1.00; // Discount factor
-pub const SAMPLES_PER_ITER: usize = 100000; // Samples per policy evaluation
+pub const SAMPLES_PER_ITER: usize = 1000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // Regularization
 const LAMBDA_TD: f64 = 0.00; // Trace decay factor
 
