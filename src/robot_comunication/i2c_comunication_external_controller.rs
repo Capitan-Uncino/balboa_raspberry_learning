@@ -74,6 +74,8 @@ pub struct RawMeasurements {
     pub encoder_right_zero: i32,
 
     // Current Tick Data
+    pub a_x_raw: i16,
+    pub a_z_raw: i16,
     pub g_y_raw: i16,
     pub encoder_left: i32,
     pub encoder_right: i32,
@@ -122,13 +124,13 @@ fn init_and_calibrate_imu(
 
     let mut total_g_y: i64 = 0;
     let mut total_accel_x: i64 = 0;
-    let mut total_accel_y: i64 = 0; // <-- Added Y
+    let mut total_accel_y: i64 = 0;
     let mut total_accel_z: i64 = 0;
 
     for _ in 0..CALIBRATION_ITERATIONS {
         let mut buf_gy = [0u8; 2];
         let mut buf_ax = [0u8; 2];
-        let mut buf_ay = [0u8; 2]; // <-- Added Y
+        let mut buf_ay = [0u8; 2];
         let mut buf_az = [0u8; 2];
 
         // Read Gyro Y
@@ -137,11 +139,11 @@ fn init_and_calibrate_imu(
 
         // Read Accel X, Y & Z
         bus.write_read(&[LSM6_OUTX_L_XL], &mut buf_ax)?;
-        bus.write_read(&[LSM6_OUTY_L_XL], &mut buf_ay)?; // <-- Added Y
+        bus.write_read(&[LSM6_OUTY_L_XL], &mut buf_ay)?;
         bus.write_read(&[LSM6_OUTZ_L_XL], &mut buf_az)?;
 
         total_accel_x += i16::from_le_bytes(buf_ax) as i64;
-        total_accel_y += i16::from_le_bytes(buf_ay) as i64; // <-- Added Y
+        total_accel_y += i16::from_le_bytes(buf_ay) as i64;
         total_accel_z += i16::from_le_bytes(buf_az) as i64;
 
         thread::sleep(Duration::from_millis(1));
@@ -150,7 +152,7 @@ fn init_and_calibrate_imu(
     // Averages
     let g_y_zero = (total_g_y / CALIBRATION_ITERATIONS as i64) as i32;
     let avg_accel_x = (total_accel_x / CALIBRATION_ITERATIONS as i64) as f64;
-    let avg_accel_y = (total_accel_y / CALIBRATION_ITERATIONS as i64) as f64; // <-- Added Y
+    let avg_accel_y = (total_accel_y / CALIBRATION_ITERATIONS as i64) as f64;
     let avg_accel_z = (total_accel_z / CALIBRATION_ITERATIONS as i64) as f64;
 
     // Log the raw values
@@ -182,6 +184,8 @@ fn init_and_calibrate_imu(
         encoder_left_zero: 0,
         encoder_right_zero: 0,
         g_y_raw: 0,
+        a_x_raw: 0,
+        a_z_raw: 0,
         encoder_left: 0,
         encoder_right: 0,
         battery_mv: 0,
@@ -224,6 +228,20 @@ fn gather_raw_state(i2c_bus: &Arc<Mutex<I2c>>, raw: &mut RawMeasurements) -> boo
         }
     }
 
+    if bus.set_slave_address(LSM6_ADDR).is_ok() {
+        let mut buf = [0u8; 2];
+        if bus.write_read(&[LSM6_OUTX_L_XL], &mut buf).is_ok() {
+            raw.a_x_raw = i16::from_le_bytes(buf);
+        }
+    }
+
+    if bus.set_slave_address(LSM6_ADDR).is_ok() {
+        let mut buf = [0u8; 2];
+        if bus.write_read(&[LSM6_OUTZ_L_XL], &mut buf).is_ok() {
+            raw.a_z_raw = i16::from_le_bytes(buf);
+        }
+    }
+
     // 3. Telemetry Read
     if bus.set_slave_address(ARDUINO_ADDR).is_err() {
         return false;
@@ -243,10 +261,20 @@ fn gather_raw_state(i2c_bus: &Arc<Mutex<I2c>>, raw: &mut RawMeasurements) -> boo
 fn process_measurements(raw: &RawMeasurements, old_state: &ProcessedState) -> ProcessedState {
     // 1. Calculate physics
     let theta_dot = (raw.g_y_raw as f64 - raw.g_y_zero as f64) / BITS * DPS / RAD2DEG;
-    let mut theta = old_state.theta + theta_dot * raw.dt;
-    if theta.abs() < STOP_TILT_RAD {
-        theta *= 0.999
-    }
+
+    let acc_weight = 0.01;
+
+    let gyro_weight = 0.99;
+
+    let acc_theta = raw.a_z_raw as f64 / raw.a_x_raw as f64;
+
+    let gyro_theta = old_state.theta + theta_dot * raw.dt;
+
+    let acc_theta_weighted = acc_weight * acc_theta;
+
+    let gyro_theta_weighted = gyro_weight * gyro_theta;
+
+    let theta = acc_theta_weighted + gyro_theta_weighted;
 
     let phi_left = (raw.encoder_left - raw.encoder_left_zero) as f64 / TICKS_RADIAN;
     let phi_right = (raw.encoder_right - raw.encoder_right_zero) as f64 / TICKS_RADIAN;
