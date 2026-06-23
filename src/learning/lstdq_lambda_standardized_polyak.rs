@@ -4,6 +4,9 @@ use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
 pub const DT: f64 = 0.01;
 
+pub const Q_COST: [f64; 4] = [10.0, 100.0, 2.0, 5.0];
+pub const R_COST: [f64; 1] = [3.0];
+
 // --- OPTIONAL FEATURE CONSTANTS ---
 pub const STANDARDIZATION: bool = true;
 pub const OUTLIERS_REMOVAL: bool = true;
@@ -17,7 +20,7 @@ const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 
 // --- LSPI Hyperparameters ---
 const GAMMA: f64 = 1.00; // Discount factor
-pub const SAMPLES_PER_ITER: usize = 1000; // Samples per policy evaluation
+pub const SAMPLES_PER_ITER: usize = 50000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // Regularization
 const LAMBDA_TD: f64 = 0.00; // Trace decay factor
 
@@ -148,9 +151,8 @@ fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f
     let mut a_mat = DMatrix::<f64>::zeros(DIM_PARAMS, DIM_PARAMS);
     let mut b_vec = DVector::<f64>::zeros(DIM_PARAMS);
 
-    let q_cost =
-        SMatrix::<f64, DIM_X, DIM_X>::from_diagonal(&SVector::from([10.0, 100.0, 0.0, 0.1]));
-    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([3.0]));
+    let q_cost = SMatrix::<f64, DIM_X, DIM_X>::from_diagonal(&SVector::from(Q_COST));
+    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from(R_COST));
 
     let mut skipped_couples = 0;
     let state_jump_threshold = 2.0;
@@ -252,6 +254,23 @@ fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f
         skipped_couples, total_couples
     );
 
+    let svd = a_mat.clone().svd(false, false);
+    let singular_values = svd.singular_values;
+
+    // nalgebra sorts singular values in descending order
+    let max_sv = singular_values[0];
+    let min_sv = singular_values[singular_values.len() - 1];
+    let condition_number = if min_sv > 1e-12 {
+        max_sv / min_sv
+    } else {
+        f64::INFINITY
+    };
+
+    println!(
+        "LSTDQ A Matrix -> Cond: {:.2}, Min SV: {:.4}, Max SV: {:.4}",
+        condition_number, min_sv, max_sv
+    );
+
     // --- STEP 4: Least Squares Regularization ---
     if LS_REGULARIZATION {
         for i in 0..DIM_PARAMS {
@@ -291,7 +310,7 @@ pub fn calculate_k(
 
     // 2. Apply Polyak Averaging (Policy-Space Trust Region)
     // alpha determines the step size. 0.1 means we move 10% towards the new optimum.
-    let alpha = 1.0;
+    let alpha = 0.1;
 
     // K_new = (1 - \alpha) * K_old + \alpha * K_greedy
     let k_trust = current_k * (1.0 - alpha) + k_greedy * alpha;

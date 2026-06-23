@@ -1,15 +1,20 @@
 use crate::file_utils::get_next_file_index;
 use crate::learning::lstdq_lambda_standardized_polyak::{
-    calculate_k, StateAction, ANALYTIC_LQR_POLICY, SAMPLES_PER_ITER,
+    calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, DT, Q_COST, R_COST,
+    SAMPLES_PER_ITER,
 };
 use crate::logging_utils::log_progress;
+use chrono::Local;
+use nalgebra::{SMatrix, SVector};
+use rand_distr::{Distribution, Normal};
 use rppal::i2c::I2c;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
+use std::io::BufWriter;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{f64, thread};
 
 // --- I2C ADDRESSES ---
 const ARDUINO_ADDR: u16 = 0x08;
@@ -36,8 +41,10 @@ const TICKS_RADIAN: f64 = 161.0; // 12 * 51.45 * 41 / 25
 const BITS: f64 = 29000.0; // ±32768.0 -> 2**15 equivalent scalar
 const DPS: f64 = 1000.0;
 const RAD2DEG: f64 = 57.296; // 180 / pi
-const K_LATERAL: f64 = 0.5; // Converted to radians for internal math
-
+const K_LATERAL_P: f64 = 4.0;
+const K_LATERAL_I: f64 = 0.5;
+const K_LATERAL_D: f64 = 0.1;
+const BALANCE_ANGLE_RADIANS: f64 = 0.1311;
 const DEBUG: bool = true;
 
 // --- LOGGING HELPER ---
@@ -55,7 +62,6 @@ fn system_log(log_file: &Arc<Mutex<File>>, level: &str, msg: &str) {
         println!("{}", log_line);
     }
 
-    // Append to file
     //if let Ok(mut file) = log_file.lock() {
     //    let _ = writeln!(file, "{}", log_line);
     //    let _ = file.flush(); // Ensure it writes immediately in case of power loss
@@ -72,6 +78,9 @@ pub struct RawMeasurements {
     pub last_encoder_right: i32,
     pub encoder_left_zero: i32,
     pub encoder_right_zero: i32,
+    pub a_x_accumulator: f64,
+    pub a_z_accumulator: f64,
+    pub encoder_accumulator: f64,
 
     // Current Tick Data
     pub a_x_raw: i16,
@@ -88,6 +97,9 @@ pub struct ProcessedState {
     // Controller Memory (Persists across loops)
     pub last_direction_forward: bool,
     pub last_oscillation_time: Instant,
+    pub ou_noise: f64,
+    pub phi_diff_i: f64,
+    pub phi_diff_d: f64,
 
     // Current Tick Physics
     pub phi: f64,
@@ -183,9 +195,12 @@ fn init_and_calibrate_imu(
         last_encoder_right: 0,
         encoder_left_zero: 0,
         encoder_right_zero: 0,
+        encoder_accumulator: 0.0,
         g_y_raw: 0,
         a_x_raw: 0,
         a_z_raw: 0,
+        a_x_accumulator: 0.0,
+        a_z_accumulator: 0.0,
         encoder_left: 0,
         encoder_right: 0,
         battery_mv: 0,
@@ -195,6 +210,9 @@ fn init_and_calibrate_imu(
     let processed = ProcessedState {
         last_direction_forward: true,
         last_oscillation_time: Instant::now(),
+        ou_noise: 0.0,
+        phi_diff_i: 0.0,
+        phi_diff_d: 0.0,
         phi: 0.0,
         phi_dot: 0.0,
         theta: initial_theta,
@@ -258,59 +276,109 @@ fn gather_raw_state(i2c_bus: &Arc<Mutex<I2c>>, raw: &mut RawMeasurements) -> boo
     true
 }
 
-fn process_measurements(raw: &RawMeasurements, old_state: &ProcessedState) -> ProcessedState {
+fn process_measurements(
+    raw: &mut RawMeasurements,
+    old_state: &ProcessedState,
+    complementary_filter: bool,
+    smoothed_derivative: bool,
+) -> ProcessedState {
     // 1. Calculate physics
     let theta_dot = (raw.g_y_raw as f64 - raw.g_y_zero as f64) / BITS * DPS / RAD2DEG;
 
-    let acc_weight = 0.01;
+    let theta = if complementary_filter {
+        let alpha_theta = 0.05;
 
-    let gyro_weight = 0.99;
+        let acc_weight = 0.01;
 
-    let acc_theta = raw.a_z_raw as f64 / raw.a_x_raw as f64;
+        let gyro_weight = 0.99;
 
-    let gyro_theta = old_state.theta + theta_dot * raw.dt;
+        raw.a_z_accumulator =
+            alpha_theta * raw.a_z_raw as f64 + (1.0 - alpha_theta) * raw.a_z_accumulator;
 
-    let acc_theta_weighted = acc_weight * acc_theta;
+        raw.a_x_accumulator =
+            alpha_theta * raw.a_x_raw as f64 + (1.0 - alpha_theta) * raw.a_x_accumulator;
 
-    let gyro_theta_weighted = gyro_weight * gyro_theta;
+        let acc_theta = f64::atan2(raw.a_z_accumulator, raw.a_x_accumulator);
 
-    let theta = acc_theta_weighted + gyro_theta_weighted;
+        let gyro_theta = old_state.theta + theta_dot * raw.dt;
+
+        let acc_theta_weighted = acc_weight * acc_theta;
+
+        let gyro_theta_weighted = gyro_weight * gyro_theta;
+
+        acc_theta_weighted + gyro_theta_weighted
+    } else {
+        let mut angle = old_state.theta + theta_dot * raw.dt;
+        if old_state.theta.abs() < STOP_TILT_RAD {
+            angle *= 0.999;
+        }
+        angle
+    };
 
     let phi_left = (raw.encoder_left - raw.encoder_left_zero) as f64 / TICKS_RADIAN;
     let phi_right = (raw.encoder_right - raw.encoder_right_zero) as f64 / TICKS_RADIAN;
 
     let phi = (phi_left + phi_right) / 2.0;
-    let phi_dot = ((raw.encoder_left - raw.last_encoder_left) as f64 / TICKS_RADIAN / raw.dt
-        + (raw.encoder_right - raw.last_encoder_right) as f64 / TICKS_RADIAN / raw.dt)
-        / 2.0;
+
+    let phi_dot = if smoothed_derivative {
+        let alpha_phi = 0.30;
+        let phi_dot_raw =
+            ((raw.encoder_left - raw.last_encoder_left) as f64 / TICKS_RADIAN / raw.dt
+                + (raw.encoder_right - raw.last_encoder_right) as f64 / TICKS_RADIAN / raw.dt)
+                / 2.0;
+        raw.encoder_accumulator =
+            alpha_phi * phi_dot_raw + (1.0 - alpha_phi) * raw.encoder_accumulator;
+        raw.encoder_accumulator
+    } else {
+        ((raw.encoder_left - raw.last_encoder_left) as f64 / TICKS_RADIAN / raw.dt
+            + (raw.encoder_right - raw.last_encoder_right) as f64 / TICKS_RADIAN / raw.dt)
+            / 2.0
+    };
+
+    let phi_diff = phi_left - phi_right;
 
     // 2. Return the new state, carrying forward the persistence
     ProcessedState {
         // Carry forward persistence
         last_direction_forward: old_state.last_direction_forward,
         last_oscillation_time: old_state.last_oscillation_time,
+        ou_noise: old_state.ou_noise,
 
         // Update with fresh physics
         phi,
         phi_dot,
         theta,
         theta_dot,
-        phi_diff: phi_left - phi_right,
+        phi_diff,
+        phi_diff_i: if old_state.theta.abs() < STOP_TILT_RAD {
+            old_state.phi_diff_i + phi_diff
+        } else {
+            0.0
+        },
+        phi_diff_d: phi_diff - old_state.phi_diff,
         battery_mv: raw.battery_mv,
     }
 }
 
 fn compute_control_action(
     state: &mut ProcessedState,
-    current_k: &Arc<Mutex<nalgebra::SMatrix<f64, 1, 4>>>,
+    current_k: Arc<Mutex<nalgebra::SMatrix<f64, 1, 4>>>,
     was_balancing: &bool,
     avoid_oscillations: bool,
+    enable_noise: bool,
+    enable_balance_angle_compensation: bool,
 ) -> (f64, i16, i16) {
     if !was_balancing {
         return (0.0, 0, 0);
     }
 
-    let u_physical = {
+    let k = current_k.lock().unwrap();
+    let mut u_physical = if enable_balance_angle_compensation {
+        k[(0, 0)] * state.phi
+            + k[(0, 1)] * (state.theta - BALANCE_ANGLE_RADIANS)
+            + k[(0, 2)] * state.phi_dot
+            + k[(0, 3)] * state.theta_dot
+    } else {
         let k = current_k.lock().unwrap();
         k[(0, 0)] * state.phi
             + k[(0, 1)] * state.theta
@@ -318,16 +386,37 @@ fn compute_control_action(
             + k[(0, 3)] * state.theta_dot
     };
 
-    let u_left = u_physical - (state.phi_diff * K_LATERAL);
-    let u_right = u_physical + (state.phi_diff * K_LATERAL);
+    if enable_noise {
+        let sigma_ou = 0.60;
+        let theta_ou = 0.60;
+        let dt: f64 = 0.01;
 
+        let mut rng = rand::rng();
+        let normal = Normal::new(0.0, 1.0).unwrap();
+        let standard_normal = normal.sample(&mut rng);
+
+        // Euler-Maruyama discretization of the Ornstein-Uhlenbeck process
+        // dX_t = -theta * X_t * dt + sigma * dW_t
+        let dw = dt.sqrt() * standard_normal;
+        state.ou_noise += -theta_ou * state.ou_noise * dt + sigma_ou * dw;
+
+        u_physical += state.ou_noise;
+    }
+    let u_left = u_physical
+        - (state.phi_diff * K_LATERAL_P
+            + state.phi_diff_i * K_LATERAL_I
+            + state.phi_diff_d * K_LATERAL_D);
+    let u_right = u_physical
+        + (state.phi_diff * K_LATERAL_P
+            + state.phi_diff_i * K_LATERAL_I
+            + state.phi_diff_d * K_LATERAL_D);
     let mut v_batt = state.battery_mv as f64 / 1000.0;
     if v_batt < 1.0 {
         v_batt = 7.4;
     }
 
-    let mut pwm_left = ((400.0 / v_batt) * u_left).clamp(-400.0, 400.0) as i16;
-    let mut pwm_right = ((400.0 / v_batt) * u_right).clamp(-400.0, 400.0) as i16;
+    let pwm_left = ((400.0 / v_batt) * u_left).clamp(-400.0, 400.0) as i16;
+    let pwm_right = ((400.0 / v_batt) * u_right).clamp(-400.0, 400.0) as i16;
 
     if avoid_oscillations {
         let present_forward = u_physical >= 0.0;
@@ -373,17 +462,19 @@ pub fn collect_full_batch(
     i2c_bus: &Arc<Mutex<I2c>>,
     log_label: &str,
     batch_index: usize,
-    was_balancing: &mut bool,
-    current_k: &Arc<Mutex<nalgebra::SMatrix<f64, 1, 4>>>,
+    current_k: Arc<Mutex<nalgebra::SMatrix<f64, 1, 4>>>,
     log_file: &Arc<Mutex<File>>,
     raw: &mut RawMeasurements,
     state: &mut ProcessedState,
+    batch_size: usize,
+    enable_noise: bool,
 ) -> Vec<StateAction> {
-    let mut state_batch = Vec::with_capacity(SAMPLES_PER_ITER);
+    let mut state_batch = Vec::with_capacity(batch_size);
     let mut loop_counter = 0;
     let mut stability_counter = 0;
     let stability_threshold = 10;
     let mut i2c_error_state = false;
+    let mut was_balancing = false;
 
     if gather_raw_state(i2c_bus, raw) {
         raw.last_encoder_left = raw.encoder_left;
@@ -395,7 +486,7 @@ pub fn collect_full_batch(
 
     let mut iteration_count = 0;
 
-    while state_batch.len() < SAMPLES_PER_ITER {
+    while state_batch.len() < batch_size {
         iteration_count += 1;
         // 1. GATHER
         if gather_raw_state(i2c_bus, raw) {
@@ -406,7 +497,8 @@ pub fn collect_full_batch(
 
             // 2. PROCESS
             // Create a new tick state, carrying over memory from the persistent ProcessedState
-            let mut current_state = process_measurements(raw, state);
+            let complementary_filter = true;
+            let mut current_state = process_measurements(raw, state, complementary_filter, false);
 
             if DEBUG && iteration_count % 1000 == 1 {
                 println!("[DEBUG] current state {:?}", current_state);
@@ -414,8 +506,14 @@ pub fn collect_full_batch(
 
             // 3. COMPUTE CONTROL
             // Returns (Average Physical U, PWM Left, PWM Right)
-            let (u_avg, speed_left, speed_right) =
-                compute_control_action(&mut current_state, current_k, was_balancing, true);
+            let (u_avg, speed_left, speed_right) = compute_control_action(
+                &mut current_state,
+                current_k.clone(),
+                &was_balancing,
+                true,
+                enable_noise,
+                complementary_filter,
+            );
 
             // 4. ACTUATE
             write_commands(i2c_bus, speed_left, speed_right, log_file);
@@ -425,13 +523,13 @@ pub fn collect_full_batch(
                 stability_counter += 1;
 
                 if stability_counter >= stability_threshold {
-                    if !*was_balancing {
+                    if !was_balancing {
                         system_log(
                             log_file,
                             "STATE",
                             &format!("ROBOT STANDING: Resuming {}...", log_label),
                         );
-                        *was_balancing = true;
+                        was_balancing = true;
 
                         // Reset positional drift on the raw measurement tracker
                         current_state.theta = 0.0;
@@ -456,19 +554,19 @@ pub fn collect_full_batch(
 
                     loop_counter += 1;
                     if loop_counter >= 100 {
-                        log_progress(state_batch.len(), SAMPLES_PER_ITER, batch_index, log_label);
+                        log_progress(state_batch.len(), batch_size, batch_index, log_label);
                         loop_counter = 0;
                     }
                 }
             } else if current_state.theta.abs() > STOP_TILT_RAD {
                 stability_counter = 0;
-                if *was_balancing {
+                if was_balancing {
                     system_log(
                         log_file,
                         "WARN",
                         &format!("ROBOT FELL: Pausing {}...", log_label),
                     );
-                    *was_balancing = false;
+                    was_balancing = false;
                 }
             }
 
@@ -556,30 +654,64 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
     // ✨ CALIBRATE ONCE HERE
     let (mut measures, mut state) = init_and_calibrate_imu(&i2c_bus, &log_target)?;
 
-    let initial_k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&ANALYTIC_LQR_POLICY);
+    let initial_k_mat = SMatrix::<f64, 1, 4>::from_row_slice(&ANALYTIC_LQR_POLICY);
     let current_k = Arc::new(Mutex::new(initial_k_mat));
 
     let mut computations_completed = 0;
-    let mut was_balancing = false;
 
     system_log(&log_target, "INFO", "Starting 100Hz I2C control loop...");
 
     loop {
-        let batch_to_process = collect_full_batch(
+        // 1. Collect Big Batch (Exploration Noise ON)
+        let big_batch = collect_full_batch(
             &i2c_bus,
-            "LSTDQ Batch",
+            "Train Batch",
             computations_completed,
-            &mut was_balancing,
-            &current_k,
+            current_k.clone(),
             &log_target,
             &mut measures,
             &mut state,
+            SAMPLES_PER_ITER,
+            true,
         );
 
-        computations_completed += 1;
-        let k_clone = Arc::clone(&current_k);
-        let log_clone = Arc::clone(&log_target);
+        let _ = collect_full_batch(
+            &i2c_bus,
+            "Reposition Robot if necessary",
+            computations_completed,
+            current_k.clone(),
+            &log_target,
+            &mut measures,
+            &mut state,
+            SAMPLES_PER_ITER / 20,
+            false,
+        );
 
+        // 2. Collect Small Batch (Exploration Noise OFF)
+        let small_batch = collect_full_batch(
+            &i2c_bus,
+            "Eval Batch",
+            computations_completed,
+            current_k.clone(),
+            &log_target,
+            &mut measures,
+            &mut state,
+            SAMPLES_PER_ITER / 5,
+            false,
+        );
+
+        let iter_index = computations_completed;
+        computations_completed += 1;
+
+        // Snapshot the EXACT policy used during the small_batch evaluation
+        // BEFORE Thread 1 has a chance to mutate it.
+        let k_eval_snapshot = { *current_k.lock().unwrap() };
+
+        // Clones for Thread 1 (Policy Update)
+        let k_clone_1 = Arc::clone(&current_k);
+        let log_clone_1 = Arc::clone(&log_target);
+
+        // THREAD 1: Compute New Gains
         thread::spawn(move || {
             if let Some(core_ids) = core_affinity::get_core_ids() {
                 if core_ids.len() > 2 {
@@ -587,14 +719,90 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
                 }
             }
 
-            let k_to_use = { *k_clone.lock().unwrap() };
-            let new_k_mat = calculate_k(&batch_to_process, &k_to_use);
+            let k_to_use = { *k_clone_1.lock().unwrap() };
+            let new_k_mat = calculate_k(&big_batch, &k_to_use);
 
             {
-                *k_clone.lock().unwrap() = new_k_mat;
+                *k_clone_1.lock().unwrap() = new_k_mat;
             }
 
-            system_log(&log_clone, "UPDATE", "LSTDQ: New K matrix applied.");
+            system_log(&log_clone_1, "UPDATE", "LSTDQ: New K matrix applied.");
+        });
+
+        // Clones for Thread 2 (Empirical Cost)
+        let log_clone_2 = Arc::clone(&log_target);
+
+        // THREAD 2: Calculate Empirical Cost and Log to CSV
+        thread::spawn(move || {
+            if let Some(core_ids) = core_affinity::get_core_ids() {
+                if core_ids.len() > 3 {
+                    core_affinity::set_for_current(core_ids[3]);
+                }
+            }
+
+            let q_cost = SMatrix::<f64, DIM_X, DIM_X>::from_diagonal(&SVector::from(Q_COST));
+            let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from(R_COST));
+
+            let mut total_cost = 0.0;
+
+            for s in &small_batch {
+                // Construct the state vector x and action vector u
+                let x = SVector::<f64, DIM_X>::new(s.phi, s.theta, s.phi_dot, s.theta_dot);
+                let u = SVector::<f64, DIM_U>::new(s.u);
+
+                // Calculate State Cost: x^T * Q * x
+                let state_cost_mat = x.transpose() * q_cost * x;
+
+                // Calculate Action Cost: u^T * R * u
+                let action_cost_mat = u.transpose() * r_cost * u;
+
+                // Extract scalars and sum
+                total_cost += state_cost_mat[(0, 0)] + action_cost_mat[(0, 0)];
+            }
+
+            let avg_cost = total_cost / small_batch.len() as f64;
+
+            // Format Timestamp and Policy values
+            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+            let k0 = k_eval_snapshot[(0, 0)];
+            let k1 = k_eval_snapshot[(0, 1)];
+            let k2 = k_eval_snapshot[(0, 2)];
+            let k3 = k_eval_snapshot[(0, 3)];
+
+            let csv_filename = "empirical_costs.csv";
+
+            match OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(csv_filename)
+            {
+                Ok(mut file) => {
+                    // Write expanded header on the first iteration
+                    if iter_index == 0 {
+                        let _ = writeln!(file, "timestamp,iteration,avg_cost,k0,k1,k2,k3");
+                    }
+
+                    // Log the row including the new parameters
+                    if let Err(e) = writeln!(
+                        file,
+                        "{},{},{:.6},{:.6},{:.6},{:.6},{:.6}",
+                        timestamp, iter_index, avg_cost, k0, k1, k2, k3
+                    ) {
+                        system_log(
+                            &log_clone_2,
+                            "ERROR",
+                            &format!("Failed to write cost CSV: {:?}", e),
+                        );
+                    }
+                }
+                Err(e) => {
+                    system_log(
+                        &log_clone_2,
+                        "ERROR",
+                        &format!("Failed to open cost CSV: {:?}", e),
+                    );
+                }
+            }
         });
     }
 }
@@ -615,10 +823,9 @@ pub fn run_data_collection_mode() -> Result<(), Box<dyn Error>> {
 
     let file_index = get_next_file_index();
     let mut current_file_index = file_index;
-    let mut was_balancing = false;
     let data_dir = "collected_data";
 
-    let dummy_k = Arc::new(Mutex::new(nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(
+    let k = Arc::new(Mutex::new(nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(
         &ANALYTIC_LQR_POLICY,
     )));
 
@@ -636,15 +843,17 @@ pub fn run_data_collection_mode() -> Result<(), Box<dyn Error>> {
             &i2c_bus,
             "LSTDQ Batch",
             current_file_index,
-            &mut was_balancing,
-            &dummy_k,
+            k.clone(),
             &log_target,
             &mut measures,
             &mut state,
+            SAMPLES_PER_ITER,
+            true,
         );
 
         let filename = format!("{}/batch_{}.csv", data_dir, current_file_index);
-        let mut file = match File::create(&filename) {
+
+        let file = match File::create(&filename) {
             Ok(f) => f,
             Err(e) => {
                 system_log(
@@ -656,7 +865,10 @@ pub fn run_data_collection_mode() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        if let Err(e) = writeln!(file, "phi,phi_dot,theta,theta_dot,u") {
+        // Wrap the file in a BufWriter
+        let mut writer = BufWriter::new(file);
+
+        if let Err(e) = writeln!(writer, "phi,theta,phi_dot,theta_dot,u") {
             system_log(
                 &log_target,
                 "ERROR",
@@ -664,23 +876,47 @@ pub fn run_data_collection_mode() -> Result<(), Box<dyn Error>> {
             );
         }
 
+        let mut write_failed = false;
+
         for s in &batch_to_process {
-            let _ = writeln!(
-                file,
+            // Explicitly handle errors during writing
+            if let Err(e) = writeln!(
+                writer,
                 "{},{},{},{},{}",
                 s.phi, s.theta, s.phi_dot, s.theta_dot, s.u
-            );
+            ) {
+                system_log(
+                    &log_target,
+                    "ERROR",
+                    &format!("Failed to write data row to {}: {:?}", filename, e),
+                );
+                write_failed = true;
+                break; // Stop iterating if the file/disk is broken
+            }
         }
 
-        system_log(
-            &log_target,
-            "SUCCESS",
-            &format!(
-                "Saved batch to {} (Next: {})",
-                filename,
-                current_file_index + 1
-            ),
-        );
-        current_file_index += 1;
+        // Flush the buffer to ensure everything is physically written to disk
+        if let Err(e) = writer.flush() {
+            system_log(
+                &log_target,
+                "ERROR",
+                &format!("Failed to flush buffer to {}: {:?}", filename, e),
+            );
+            write_failed = true;
+        }
+
+        // Only log success and increment if the write actually completed
+        if !write_failed {
+            system_log(
+                &log_target,
+                "SUCCESS",
+                &format!(
+                    "Saved batch to {} (Next: {})",
+                    filename,
+                    current_file_index + 1
+                ),
+            );
+            current_file_index += 1;
+        }
     }
 }
