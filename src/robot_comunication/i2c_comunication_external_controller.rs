@@ -430,8 +430,9 @@ fn compute_control_action(
             }
         }
     }
+    let u_average = (pwm_left as f64 + pwm_right as f64) / 2.0;
 
-    (u_physical, pwm_left, pwm_right)
+    (u_average, pwm_left, pwm_right)
 }
 
 fn write_commands(

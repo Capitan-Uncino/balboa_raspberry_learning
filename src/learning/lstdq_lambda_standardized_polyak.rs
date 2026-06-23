@@ -8,9 +8,9 @@ pub const Q_COST: [f64; 4] = [10.0, 100.0, 2.0, 5.0];
 pub const R_COST: [f64; 1] = [3.0];
 
 // --- OPTIONAL FEATURE CONSTANTS ---
-pub const STANDARDIZATION: bool = true;
-pub const OUTLIERS_REMOVAL: bool = true;
-pub const LS_REGULARIZATION: bool = true;
+const STANDARDIZATION: bool = true;
+const OUTLIERS_REMOVAL: bool = true;
+const LS_REGULARIZATION: bool = true;
 
 // --- System Dimensions ---
 pub const DIM_X: usize = 4;
@@ -310,7 +310,7 @@ pub fn calculate_k(
 
     // 2. Apply Polyak Averaging (Policy-Space Trust Region)
     // alpha determines the step size. 0.1 means we move 10% towards the new optimum.
-    let alpha = 0.1;
+    let alpha = 1.0;
 
     // K_new = (1 - \alpha) * K_old + \alpha * K_greedy
     let k_trust = current_k * (1.0 - alpha) + k_greedy * alpha;
