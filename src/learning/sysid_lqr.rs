@@ -1,6 +1,8 @@
 use nalgebra::{DMatrix, SMatrix, SVector};
 
-pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
+//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
+//
+pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
 pub const DT: f64 = 0.01;
 
 pub const Q_COST: [f64; 4] = [10.0, 100.0, 2.0, 5.0];
@@ -11,7 +13,7 @@ pub const DIM_X: usize = 4;
 pub const DIM_U: usize = 1;
 const DIM_X_AND_U: usize = DIM_X + DIM_U;
 const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
-pub const DEBUG: bool = true;
+pub const DEBUG: bool = false;
 pub const SAMPLES_PER_ITER: usize = 50000; // Samples per policy evaluation
 
 fn spectral_radius(

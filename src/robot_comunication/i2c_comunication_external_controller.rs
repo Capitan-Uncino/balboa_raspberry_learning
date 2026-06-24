@@ -46,6 +46,7 @@ const K_LATERAL_I: f64 = 0.0;
 const K_LATERAL_D: f64 = 0.0;
 const BALANCE_ANGLE_RADIANS: f64 = 0.1311;
 const DEBUG: bool = false;
+const CONTROL_LOOP_DURATION_MILLIS: f64 = 10.0;
 
 // --- LOGGING HELPER ---
 fn system_log(log_file: &Arc<Mutex<File>>, level: &str, msg: &str) {
@@ -431,7 +432,7 @@ fn compute_control_action(
     }
     let u_average = (pwm_left as f64 + pwm_right as f64) / 2.0;
 
-    (u_average, pwm_left, pwm_right)
+    (u_physical, pwm_left, pwm_right)
 }
 
 fn write_commands(
@@ -487,6 +488,8 @@ pub fn collect_full_batch(
     let mut iteration_count = 0;
 
     while state_batch.len() < batch_size {
+        let start_time = Instant::now();
+
         iteration_count += 1;
         // 1. GATHER
         if gather_raw_state(i2c_bus, raw) {
@@ -497,7 +500,7 @@ pub fn collect_full_batch(
 
             // 2. PROCESS
             // Create a new tick state, carrying over memory from the persistent ProcessedState
-            let complementary_filter = false;
+            let complementary_filter = true;
             let mut current_state = process_measurements(raw, state, complementary_filter, false);
 
             if DEBUG && iteration_count % 1000 == 1 {
@@ -510,13 +513,22 @@ pub fn collect_full_batch(
                 &mut current_state,
                 current_k.clone(),
                 &was_balancing,
-                true,
+                false,
                 enable_noise,
                 complementary_filter,
             );
 
             // 4. ACTUATE
             write_commands(i2c_bus, speed_left, speed_right, log_file);
+
+            let elapsed = start_time.elapsed();
+            if elapsed.as_micros() > 1500 {
+                system_log(
+                    log_file,
+                    "ERROR",
+                    &format!("control computation > 1.5ms ({} µs)", elapsed.as_micros()),
+                );
+            }
 
             // 5. STABILITY & LOGGING
             if current_state.theta.abs() < START_TILT_RAD {
@@ -587,8 +599,15 @@ pub fn collect_full_batch(
                 i2c_error_state = true;
             }
         }
-
-        thread::sleep(Duration::from_millis(10));
+        let elapsed_final = start_time.elapsed();
+        if elapsed_final.as_micros() > 6000 {
+            system_log(
+                log_file,
+                "ERROR",
+                &format!("full loop > 6ms ({} µs)", elapsed_final.as_micros()),
+            );
+        }
+        thread::sleep(Duration::from_millis(10).saturating_sub(elapsed_final));
     }
 
     system_log(

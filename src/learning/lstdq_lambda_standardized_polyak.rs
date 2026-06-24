@@ -1,7 +1,7 @@
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 
-//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
-pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
+pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
+//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
 pub const DT: f64 = 0.01;
 
 pub const Q_COST: [f64; 4] = [10.0, 100.0, 2.0, 5.0];
@@ -310,7 +310,7 @@ pub fn calculate_k(
 
     // 2. Apply Polyak Averaging (Policy-Space Trust Region)
     // alpha determines the step size. 0.1 means we move 10% towards the new optimum.
-    let alpha = 1.0;
+    let alpha = 0.1;
 
     // K_new = (1 - \alpha) * K_old + \alpha * K_greedy
     let k_trust = current_k * (1.0 - alpha) + k_greedy * alpha;

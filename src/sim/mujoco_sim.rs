@@ -1,6 +1,6 @@
 use crate::file_utils::get_next_file_index;
 use crate::graphic_utils::plot_cost_evolution;
-use crate::learning::lstdq_lambda_standardized_polyak::{
+use crate::learning::sysid_lqr::{
     calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, SAMPLES_PER_ITER,
 };
 use crate::logging_utils::log_progress;
@@ -22,7 +22,7 @@ const DEADZONE_EPSILON: f64 = 1.5 * std::f64::consts::PI / 180.0;
 const THETA_OU: f64 = 0.60;
 const SIGMA_OU: f64 = 0.30;
 const SEED: u64 = 42;
-const BACKLASH_JOINTS: bool = true;
+const BACKLASH_JOINTS: bool = false;
 const MAX_FALLS: usize = 20;
 
 pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
