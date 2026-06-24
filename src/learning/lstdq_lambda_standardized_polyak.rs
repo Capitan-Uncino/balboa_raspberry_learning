@@ -1,7 +1,7 @@
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 
-pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
-//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
+//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
+pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
 pub const DT: f64 = 0.01;
 
 pub const Q_COST: [f64; 4] = [10.0, 100.0, 2.0, 5.0];
@@ -9,7 +9,7 @@ pub const R_COST: [f64; 1] = [3.0];
 
 // --- OPTIONAL FEATURE CONSTANTS ---
 const STANDARDIZATION: bool = true;
-const OUTLIERS_REMOVAL: bool = true;
+const OUTLIERS_REMOVAL: bool = false;
 const LS_REGULARIZATION: bool = true;
 
 // --- System Dimensions ---
@@ -22,7 +22,7 @@ const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 const GAMMA: f64 = 1.00; // Discount factor
 pub const SAMPLES_PER_ITER: usize = 50000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // Regularization
-const LAMBDA_TD: f64 = 0.00; // Trace decay factor
+const LAMBDA_TD: f64 = 0.40; // Trace decay factor
 
 pub fn spectral_radius(
     a_mat: &SMatrix<f64, DIM_X, DIM_X>,
@@ -154,8 +154,9 @@ fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f
     let q_cost = SMatrix::<f64, DIM_X, DIM_X>::from_diagonal(&SVector::from(Q_COST));
     let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from(R_COST));
 
-    let mut skipped_couples = 0;
-    let state_jump_threshold = 2.0;
+    let mut skipped_discontinuity = 0;
+    let mut skipped_outliers = 0;
+    let state_jump_threshold = 100.0;
 
     // --- STEP 1: Compute Feature Statistics ---
     let (raw_mean, raw_std) = if OUTLIERS_REMOVAL || STANDARDIZATION {
@@ -193,7 +194,7 @@ fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f
 
         let state_diff_norm = (x - x_next).norm();
         if state_diff_norm > state_jump_threshold {
-            skipped_couples += 1;
+            skipped_discontinuity += 1;
             z_trace.fill(0.0);
             continue;
         }
@@ -212,7 +213,7 @@ fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f
                 }
             }
             if is_outlier {
-                skipped_couples += 1;
+                skipped_outliers += 1;
                 z_trace.fill(0.0); // Crucial: clear memory so chronological chain resets
                 continue;
             }
@@ -248,10 +249,9 @@ fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f
         }
     }
 
-    let total_couples = batch.len().saturating_sub(1);
     println!(
-        "LSTDQ(lambda) Batch Processing: Skipped {} / {} transitions.",
-        skipped_couples, total_couples
+        "LSTDQ(lambda) Batch Processing: Skipped {} transitions because of discontinuity and {} because they were outliers.",
+        skipped_discontinuity, skipped_outliers
     );
 
     let svd = a_mat.clone().svd(false, false);
@@ -310,7 +310,7 @@ pub fn calculate_k(
 
     // 2. Apply Polyak Averaging (Policy-Space Trust Region)
     // alpha determines the step size. 0.1 means we move 10% towards the new optimum.
-    let alpha = 0.1;
+    let alpha = 1.0;
 
     // K_new = (1 - \alpha) * K_old + \alpha * K_greedy
     let k_trust = current_k * (1.0 - alpha) + k_greedy * alpha;

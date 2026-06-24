@@ -422,7 +422,7 @@ fn compute_control_action(
         let present_forward = u_physical >= 0.0;
         if present_forward != state.last_direction_forward {
             let now = Instant::now();
-            if now.duration_since(state.last_oscillation_time).as_millis() < 100 {
+            if now.duration_since(state.last_oscillation_time).as_millis() < 50 {
                 return (0.0, 0, 0);
             } else {
                 state.last_oscillation_time = now;
