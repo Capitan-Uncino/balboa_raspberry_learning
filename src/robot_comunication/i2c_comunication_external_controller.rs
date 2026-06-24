@@ -32,7 +32,7 @@ const LSM6_OUTY_L_XL: u8 = 0x2A; // Accel Y
                                  //
                                  //
 
-const STOP_TILT_RAD: f64 = 60.0 / RAD2DEG;
+const STOP_TILT_RAD: f64 = 70.0 / RAD2DEG;
 const START_TILT_RAD: f64 = 20.0 / RAD2DEG;
 
 // --- EXACT PHYSICAL CONSTANTS ---
@@ -41,11 +41,11 @@ const TICKS_RADIAN: f64 = 161.0; // 12 * 51.45 * 41 / 25
 const BITS: f64 = 29000.0; // ±32768.0 -> 2**15 equivalent scalar
 const DPS: f64 = 1000.0;
 const RAD2DEG: f64 = 57.296; // 180 / pi
-const K_LATERAL_P: f64 = 4.0;
-const K_LATERAL_I: f64 = 0.5;
-const K_LATERAL_D: f64 = 0.1;
+const K_LATERAL_P: f64 = 2.0;
+const K_LATERAL_I: f64 = 0.0;
+const K_LATERAL_D: f64 = 0.0;
 const BALANCE_ANGLE_RADIANS: f64 = 0.1311;
-const DEBUG: bool = true;
+const DEBUG: bool = false;
 
 // --- LOGGING HELPER ---
 fn system_log(log_file: &Arc<Mutex<File>>, level: &str, msg: &str) {
@@ -189,7 +189,7 @@ fn init_and_calibrate_imu(
     );
 
     let raw = RawMeasurements {
-        g_y_zero: (total_g_y / CALIBRATION_ITERATIONS as i64) as i32,
+        g_y_zero,
         last_time: Instant::now(),
         last_encoder_left: 0,
         last_encoder_right: 0,
@@ -363,12 +363,12 @@ fn process_measurements(
 fn compute_control_action(
     state: &mut ProcessedState,
     current_k: Arc<Mutex<nalgebra::SMatrix<f64, 1, 4>>>,
-    was_balancing: &bool,
+    balancing: &bool,
     avoid_oscillations: bool,
     enable_noise: bool,
     enable_balance_angle_compensation: bool,
 ) -> (f64, i16, i16) {
-    if !was_balancing {
+    if !balancing {
         return (0.0, 0, 0);
     }
 
@@ -379,7 +379,6 @@ fn compute_control_action(
             + k[(0, 2)] * state.phi_dot
             + k[(0, 3)] * state.theta_dot
     } else {
-        let k = current_k.lock().unwrap();
         k[(0, 0)] * state.phi
             + k[(0, 1)] * state.theta
             + k[(0, 2)] * state.phi_dot
@@ -498,7 +497,7 @@ pub fn collect_full_batch(
 
             // 2. PROCESS
             // Create a new tick state, carrying over memory from the persistent ProcessedState
-            let complementary_filter = true;
+            let complementary_filter = false;
             let mut current_state = process_measurements(raw, state, complementary_filter, false);
 
             if DEBUG && iteration_count % 1000 == 1 {
