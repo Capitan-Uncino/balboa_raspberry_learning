@@ -1,7 +1,6 @@
 use crate::file_utils::get_next_file_index;
 use crate::learning::lstdq_lambda_standardized_polyak::{
-    calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, DT, Q_COST, R_COST,
-    SAMPLES_PER_ITER,
+    calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, Q_COST, R_COST, SAMPLES_PER_ITER,
 };
 use crate::logging_utils::log_progress;
 use chrono::Local;
@@ -49,7 +48,7 @@ const DEBUG: bool = false;
 const CONTROL_LOOP_DURATION_MILLIS: f64 = 10.0;
 
 // --- LOGGING HELPER ---
-fn system_log(log_file: &Arc<Mutex<File>>, level: &str, msg: &str) {
+fn system_log(_log_file: &Arc<Mutex<File>>, level: &str, msg: &str) {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -430,7 +429,7 @@ fn compute_control_action(
             }
         }
     }
-    let u_average = (pwm_left as f64 + pwm_right as f64) / 2.0;
+    let _u_average = (pwm_left as f64 + pwm_right as f64) / 2.0;
 
     (u_physical, pwm_left, pwm_right)
 }

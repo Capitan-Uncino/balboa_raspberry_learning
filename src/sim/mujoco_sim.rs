@@ -10,7 +10,6 @@ use nalgebra::{SMatrix, SVector};
 use rand::rngs::StdRng;
 use rand::RngExt;
 use rand::SeedableRng;
-use rand_distr::Uniform;
 use std::f64::consts::PI;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -807,7 +806,7 @@ fn apply_motor_physics<'a>(
     let pwm_resolution = 400.0;
     let max_speed = 47.5;
 
-    let gaussian_noise = 0.0;
+    let _gaussian_noise = 0.0;
 
     // 1. OU Noise
     if enable_noise {
@@ -822,7 +821,7 @@ fn apply_motor_physics<'a>(
         let exact_std_dev = discrete_variance.sqrt();
 
         // The resulting Gaussian noise
-        let gaussian_noise = exact_std_dev * epsilon;
+        let _gaussian_noise = exact_std_dev * epsilon;
 
         *last_noise += dx;
     } else {
@@ -874,7 +873,7 @@ fn process_step_result<'a>(
     let (phi, theta, phi_dot, theta_dot) = (x_k[0], x_k[1], x_k[2], x_k[3]);
 
     // Safely extract backlash if it exists in the state vector
-    let backlash = if BACKLASH_ESTIMATION { x_k[4] } else { 0.0 };
+    let _backlash = if BACKLASH_ESTIMATION { x_k[4] } else { 0.0 };
 
     let is_sane = theta.is_finite() && theta_dot.abs() < 100.0;
     let is_upright = theta.abs() < stop_angle_rad;
