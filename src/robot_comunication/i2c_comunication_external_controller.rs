@@ -1,5 +1,5 @@
 use crate::file_utils::get_next_file_index;
-use crate::learning::lstdq_lambda_standardized_polyak::{
+use crate::learning::single_batch_lspi::{
     calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, Q_COST, R_COST, SAMPLES_PER_ITER,
 };
 use crate::logging_utils::log_progress;
@@ -31,7 +31,7 @@ const LSM6_OUTY_L_XL: u8 = 0x2A; // Accel Y
                                  //
                                  //
 
-const STOP_TILT_RAD: f64 = 70.0 / RAD2DEG;
+const STOP_TILT_RAD: f64 = 60.0 / RAD2DEG;
 const START_TILT_RAD: f64 = 20.0 / RAD2DEG;
 
 // --- EXACT PHYSICAL CONSTANTS ---
@@ -40,12 +40,11 @@ const TICKS_RADIAN: f64 = 161.0; // 12 * 51.45 * 41 / 25
 const BITS: f64 = 29000.0; // ±32768.0 -> 2**15 equivalent scalar
 const DPS: f64 = 1000.0;
 const RAD2DEG: f64 = 57.296; // 180 / pi
-const K_LATERAL_P: f64 = 2.0;
+const K_LATERAL_P: f64 = 0.0;
 const K_LATERAL_I: f64 = 0.0;
 const K_LATERAL_D: f64 = 0.0;
 const BALANCE_ANGLE_RADIANS: f64 = 0.1311;
 const DEBUG: bool = false;
-const CONTROL_LOOP_DURATION_MILLIS: f64 = 10.0;
 
 // --- LOGGING HELPER ---
 fn system_log(_log_file: &Arc<Mutex<File>>, level: &str, msg: &str) {
@@ -309,7 +308,7 @@ fn process_measurements(
         acc_theta_weighted + gyro_theta_weighted
     } else {
         let mut angle = old_state.theta + theta_dot * raw.dt;
-        if old_state.theta.abs() < STOP_TILT_RAD {
+        if old_state.theta.abs() < START_TILT_RAD {
             angle *= 0.999;
         }
         angle
@@ -351,7 +350,7 @@ fn process_measurements(
         theta_dot,
         phi_diff,
         phi_diff_i: if old_state.theta.abs() < STOP_TILT_RAD {
-            old_state.phi_diff_i + phi_diff
+            old_state.phi_diff_i + phi_diff * raw.dt
         } else {
             0.0
         },
@@ -471,8 +470,9 @@ pub fn collect_full_batch(
 ) -> Vec<StateAction> {
     let mut state_batch = Vec::with_capacity(batch_size);
     let mut loop_counter = 0;
-    let mut stability_counter = 0;
+
     let stability_threshold = 10;
+    let mut stability_counter = stability_threshold - 1;
     let mut i2c_error_state = false;
     let mut was_balancing = false;
 
@@ -499,7 +499,7 @@ pub fn collect_full_batch(
 
             // 2. PROCESS
             // Create a new tick state, carrying over memory from the persistent ProcessedState
-            let complementary_filter = true;
+            let complementary_filter = false;
             let mut current_state = process_measurements(raw, state, complementary_filter, false);
 
             if DEBUG && iteration_count % 1000 == 1 {
