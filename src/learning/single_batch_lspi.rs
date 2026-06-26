@@ -1,18 +1,18 @@
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 
 //pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
-//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
+pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
 
-pub const ANALYTIC_LQR_POLICY: [f64; 4] = [
-    0.3753457176107561,
-    5.518331882767988,
-    0.3031885108767641,
-    0.7902604937780158,
-];
+//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [
+//    0.3753457176107561,
+//    5.518331882767988,
+//    0.3031885108767641,
+//    0.7902604937780158,
+//];
 
 pub const DT: f64 = 0.01;
 
-pub const Q_COST: [f64; 4] = [10.0, 100.0, 0.0, 0.1];
+pub const Q_COST: [f64; 4] = [10.0, 100.0, 2.0, 5.0];
 pub const R_COST: [f64; 1] = [1.0];
 
 // --- OPTIONAL FEATURE CONSTANTS ---
@@ -31,6 +31,9 @@ const GAMMA: f64 = 1.00; // Discount factor
 pub const SAMPLES_PER_ITER: usize = 50000; // Samples per policy evaluation
 const LAMBDA_REG: f64 = 1e-5; // Regularization
 const LAMBDA_TD: f64 = 0.40; // Trace decay factor
+
+pub const CONVERGENCE_TOLERANCE: f64 = 1e-5;
+pub const MAX_POLICY_ITERS: usize = 10;
 
 pub fn spectral_radius(
     a_mat: &SMatrix<f64, DIM_X, DIM_X>,
@@ -309,19 +312,38 @@ fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f
 
 pub fn calculate_k(
     batch: &[StateAction],
-    current_k: &SMatrix<f64, DIM_U, DIM_X>,
+    initial_k: &SMatrix<f64, DIM_U, DIM_X>,
 ) -> SMatrix<f64, DIM_U, DIM_X> {
-    // 1. Solve the projected Bellman equation to find the unconstrained optimum
-    let theta = run_lstdq(batch, current_k);
-    let h_mat = theta_to_h(&theta);
-    let k_greedy = compute_k_from_h(&h_mat);
+    let mut current_k = *initial_k;
+    let mut k_last = current_k;
+
+    // 1. Repeat LSTDQ and Policy Improvement until convergence
+    for iter in 0..MAX_POLICY_ITERS {
+        let theta = run_lstdq(batch, &current_k);
+        let h_mat = theta_to_h(&theta);
+        let k_greedy = compute_k_from_h(&h_mat);
+
+        // Calculate the norm of the difference to check for convergence
+        let diff = (&k_greedy - &current_k).norm();
+        println!("Policy Iteration {}: diff norm = {:.6}", iter, diff);
+
+        k_last = k_greedy;
+
+        if diff < CONVERGENCE_TOLERANCE {
+            println!("Policy converged after {} iterations.", iter + 1);
+            break;
+        }
+
+        // Update current_k for the next iteration
+        current_k = k_greedy;
+    }
 
     // 2. Apply Polyak Averaging (Policy-Space Trust Region)
     // alpha determines the step size. 0.1 means we move 10% towards the new optimum.
-    let alpha = 1.0;
+    let alpha = 0.05;
 
-    // K_new = (1 - \alpha) * K_old + \alpha * K_greedy
-    let k_trust = current_k * (1.0 - alpha) + k_greedy * alpha;
+    // K_new = (1 - \alpha) * K_initial + \alpha * K_last
+    let k_trust = initial_k * (1.0 - alpha) + k_last * alpha;
 
     println!(">>> Trust Region Applied: alpha = {}", alpha);
 

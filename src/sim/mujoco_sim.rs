@@ -1,7 +1,7 @@
 use crate::file_utils::get_next_file_index;
 use crate::graphic_utils::plot_cost_evolution;
-use crate::learning::sysid_lqr::{
-    calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, SAMPLES_PER_ITER,
+use crate::learning::single_batch_lspi::{
+    calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, Q_COST, R_COST, SAMPLES_PER_ITER,
 };
 use crate::logging_utils::log_progress;
 use mujoco_rs::prelude::*;
@@ -21,7 +21,7 @@ const DEADZONE_EPSILON: f64 = 1.5 * std::f64::consts::PI / 180.0;
 const THETA_OU: f64 = 0.60;
 const SIGMA_OU: f64 = 0.30;
 const SEED: u64 = 42;
-const BACKLASH_JOINTS: bool = false;
+const BACKLASH_JOINTS: bool = true;
 const MAX_FALLS: usize = 20;
 
 pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -620,13 +620,8 @@ fn calculate_discrete_lqr(
     control_step: f64,
 ) -> SMatrix<f64, DIM_U, 4> {
     // 1. Define strictly 4D LQR Cost Weights
-    let q_cost = SMatrix::<f64, 4, 4>::from_diagonal(&SVector::from([
-        10.0,  // phi penalty
-        100.0, // theta penalty
-        0.0,   // phi_dot penalty
-        0.1,   // theta_dot penalty
-    ]));
-    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from([3.0]));
+    let q_cost = SMatrix::<f64, 4, 4>::from_diagonal(&SVector::from(Q_COST));
+    let r_cost = SMatrix::<f64, DIM_U, DIM_U>::from_diagonal(&SVector::from(R_COST));
 
     // 2. Discretize 4D A and B
     let a_d = SMatrix::<f64, 4, 4>::identity() + a_mat * control_step;
@@ -948,11 +943,12 @@ fn process_step_result<'a>(
                 tracker.total_cost += penalty_per_step * (max_steps - current_step) as f64;
                 return StepAction::Break;
             }
-            let state_cost = 10.0 * phi.powi(2)
-                + 100.0 * theta.powi(2)
-                + 0.0 * phi_dot.powi(2)
-                + 0.1 * theta_dot.powi(2);
-            tracker.total_cost += state_cost + 3.0 * raw_tau.powi(2);
+
+            let state_cost = Q_COST[0] * phi.powi(2)
+                + Q_COST[1] * theta.powi(2)
+                + Q_COST[2] * phi_dot.powi(2)
+                + Q_COST[3] * theta_dot.powi(2);
+            tracker.total_cost += state_cost + R_COST[0] * raw_tau.powi(2);
         }
         SimTask::EstimateProcessNoise => {
             let (pl, pr, t, pdl, pdr, td) = extract_state(data, BACKLASH_JOINTS);

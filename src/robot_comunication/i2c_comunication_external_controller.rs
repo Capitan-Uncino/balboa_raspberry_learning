@@ -421,7 +421,7 @@ fn compute_control_action(
         let present_forward = u_physical >= 0.0;
         if present_forward != state.last_direction_forward {
             let now = Instant::now();
-            if now.duration_since(state.last_oscillation_time).as_millis() < 50 {
+            if now.duration_since(state.last_oscillation_time).as_millis() < 100 {
                 return (0.0, 0, 0);
             } else {
                 state.last_oscillation_time = now;
@@ -512,7 +512,7 @@ pub fn collect_full_batch(
                 &mut current_state,
                 current_k.clone(),
                 &was_balancing,
-                false,
+                true,
                 enable_noise,
                 complementary_filter,
             );
@@ -599,11 +599,11 @@ pub fn collect_full_batch(
             }
         }
         let elapsed_final = start_time.elapsed();
-        if elapsed_final.as_micros() > 6000 {
+        if elapsed_final.as_micros() > 5000 {
             system_log(
                 log_file,
                 "ERROR",
-                &format!("full loop > 6ms ({} µs)", elapsed_final.as_micros()),
+                &format!("full loop > 5ms ({} µs)", elapsed_final.as_micros()),
             );
         }
         thread::sleep(Duration::from_millis(10).saturating_sub(elapsed_final));
