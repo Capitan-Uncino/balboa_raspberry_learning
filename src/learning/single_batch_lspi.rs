@@ -314,6 +314,17 @@ pub fn calculate_k(
     batch: &[StateAction],
     initial_k: &SMatrix<f64, DIM_U, DIM_X>,
 ) -> SMatrix<f64, DIM_U, DIM_X> {
+    // Helper closure to map the 4 matrix elements to their respective names
+    let format_policy = |k: &SMatrix<f64, DIM_U, DIM_X>| {
+        format!(
+            "K_PHI: {:.6}, K_THETA: {:.6}, K_PHIDOT: {:.6}, K_THETADOT: {:.6}",
+            k[0], k[1], k[2], k[3]
+        )
+    };
+
+    println!("--- Initial Policy ---");
+    println!("{}", format_policy(initial_k));
+
     let mut current_k = *initial_k;
     let mut k_last = current_k;
 
@@ -326,6 +337,9 @@ pub fn calculate_k(
         // Calculate the norm of the difference to check for convergence
         let diff = (&k_greedy - &current_k).norm();
         println!("Policy Iteration {}: diff norm = {:.6}", iter, diff);
+
+        // Print the policy after this iteration
+        println!("Iter {} Policy -> {}", iter, format_policy(&k_greedy));
 
         k_last = k_greedy;
 
@@ -346,6 +360,8 @@ pub fn calculate_k(
     let k_trust = initial_k * (1.0 - alpha) + k_last * alpha;
 
     println!(">>> Trust Region Applied: alpha = {}", alpha);
+    println!("--- Final Policy (After Polyak Averaging) ---");
+    println!("{}", format_policy(&k_trust));
 
     k_trust
 }

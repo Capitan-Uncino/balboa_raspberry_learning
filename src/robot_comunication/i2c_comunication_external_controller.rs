@@ -40,8 +40,8 @@ const TICKS_RADIAN: f64 = 161.0; // 12 * 51.45 * 41 / 25
 const BITS: f64 = 29000.0; // ±32768.0 -> 2**15 equivalent scalar
 const DPS: f64 = 1000.0;
 const RAD2DEG: f64 = 57.296; // 180 / pi
-const K_LATERAL_P: f64 = 0.0;
-const K_LATERAL_I: f64 = 0.0;
+const K_LATERAL_P: f64 = 5.0;
+const K_LATERAL_I: f64 = 5.0;
 const K_LATERAL_D: f64 = 0.0;
 const BALANCE_ANGLE_RADIANS: f64 = 0.1311;
 const DEBUG: bool = false;
@@ -308,7 +308,7 @@ fn process_measurements(
         acc_theta_weighted + gyro_theta_weighted
     } else {
         let mut angle = old_state.theta + theta_dot * raw.dt;
-        if old_state.theta.abs() < START_TILT_RAD {
+        if old_state.theta.abs() < STOP_TILT_RAD {
             angle *= 0.999;
         }
         angle
@@ -320,7 +320,7 @@ fn process_measurements(
     let phi = (phi_left + phi_right) / 2.0;
 
     let phi_dot = if smoothed_derivative {
-        let alpha_phi = 0.30;
+        let alpha_phi = 0.50;
         let phi_dot_raw =
             ((raw.encoder_left - raw.last_encoder_left) as f64 / TICKS_RADIAN / raw.dt
                 + (raw.encoder_right - raw.last_encoder_right) as f64 / TICKS_RADIAN / raw.dt)
@@ -421,7 +421,7 @@ fn compute_control_action(
         if present_forward != state.last_direction_forward {
             let now = Instant::now();
             if now.duration_since(state.last_oscillation_time).as_millis() < 100 {
-                return (0.0, 0, 0);
+                return (u_physical, 0, 0);
             } else {
                 state.last_oscillation_time = now;
                 state.last_direction_forward = present_forward;
@@ -499,8 +499,8 @@ pub fn collect_full_batch(
 
             // 2. PROCESS
             // Create a new tick state, carrying over memory from the persistent ProcessedState
-            let complementary_filter = false;
-            let mut current_state = process_measurements(raw, state, complementary_filter, false);
+            let complementary_filter = true;
+            let mut current_state = process_measurements(raw, state, complementary_filter, true);
 
             if DEBUG && iteration_count % 1000 == 1 {
                 println!("[DEBUG] current state {:?}", current_state);
