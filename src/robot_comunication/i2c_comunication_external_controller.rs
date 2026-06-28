@@ -43,8 +43,9 @@ const RAD2DEG: f64 = 57.296; // 180 / pi
 const K_LATERAL_P: f64 = 5.0;
 const K_LATERAL_I: f64 = 5.0;
 const K_LATERAL_D: f64 = 0.0;
-const BALANCE_ANGLE_RADIANS: f64 = 0.1311;
+const BALANCE_ANGLE_RADIANS: f64 = 0.1553;
 const DEBUG: bool = false;
+const COMPLEMENTARY_FILTER_ENABLED: bool = true;
 
 // --- LOGGING HELPER ---
 fn system_log(_log_file: &Arc<Mutex<File>>, level: &str, msg: &str) {
@@ -499,7 +500,7 @@ pub fn collect_full_batch(
 
             // 2. PROCESS
             // Create a new tick state, carrying over memory from the persistent ProcessedState
-            let complementary_filter = true;
+            let complementary_filter = COMPLEMENTARY_FILTER_ENABLED;
             let mut current_state = process_measurements(raw, state, complementary_filter, true);
 
             if DEBUG && iteration_count % 1000 == 1 {
@@ -512,7 +513,7 @@ pub fn collect_full_batch(
                 &mut current_state,
                 current_k.clone(),
                 &was_balancing,
-                true,
+                false,
                 enable_noise,
                 complementary_filter,
             );
@@ -554,14 +555,24 @@ pub fn collect_full_batch(
                         }
                     }
 
-                    // Log the snapshot
-                    state_batch.push(StateAction {
-                        phi: current_state.phi,
-                        theta: current_state.theta,
-                        phi_dot: current_state.phi_dot,
-                        theta_dot: current_state.theta_dot,
-                        u: u_avg,
-                    });
+                    if complementary_filter {
+                        state_batch.push(StateAction {
+                            phi: current_state.phi,
+                            theta: current_state.theta - BALANCE_ANGLE_RADIANS,
+                            phi_dot: current_state.phi_dot,
+                            theta_dot: current_state.theta_dot,
+                            u: u_avg,
+                        });
+                    } else {
+                        // Log the snapshot
+                        state_batch.push(StateAction {
+                            phi: current_state.phi,
+                            theta: current_state.theta,
+                            phi_dot: current_state.phi_dot,
+                            theta_dot: current_state.theta_dot,
+                            u: u_avg,
+                        });
+                    }
 
                     loop_counter += 1;
                     if loop_counter >= 100 {
@@ -765,7 +776,16 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
 
             for s in &small_batch {
                 // Construct the state vector x and action vector u
-                let x = SVector::<f64, DIM_X>::new(s.phi, s.theta, s.phi_dot, s.theta_dot);
+                let x = SVector::<f64, DIM_X>::new(
+                    s.phi,
+                    if COMPLEMENTARY_FILTER_ENABLED {
+                        s.theta - BALANCE_ANGLE_RADIANS
+                    } else {
+                        s.theta
+                    },
+                    s.phi_dot,
+                    s.theta_dot,
+                );
                 let u = SVector::<f64, DIM_U>::new(s.u);
 
                 // Calculate State Cost: x^T * Q * x

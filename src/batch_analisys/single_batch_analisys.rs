@@ -1,6 +1,4 @@
-use crate::learning::lstdq_lambda_standardized_polyak::{
-    calculate_k, StateAction, ANALYTIC_LQR_POLICY,
-};
+use crate::learning::single_batch_lspi::{calculate_k, StateAction, ANALYTIC_LQR_POLICY};
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, Read, Write};

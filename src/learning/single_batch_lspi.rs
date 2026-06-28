@@ -12,12 +12,12 @@ pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
 
 pub const DT: f64 = 0.01;
 
-pub const Q_COST: [f64; 4] = [10.0, 100.0, 2.0, 5.0];
-pub const R_COST: [f64; 1] = [1.0];
+pub const Q_COST: [f64; 4] = [10.0, 100.0, 0.0, 0.1];
+pub const R_COST: [f64; 1] = [3.0];
 
 // --- OPTIONAL FEATURE CONSTANTS ---
 const STANDARDIZATION: bool = true;
-const OUTLIERS_REMOVAL: bool = true;
+const OUTLIERS_REMOVAL: bool = false;
 const LS_REGULARIZATION: bool = true;
 
 // --- System Dimensions ---
@@ -29,8 +29,8 @@ const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
 // --- LSPI Hyperparameters ---
 const GAMMA: f64 = 1.00; // Discount factor
 pub const SAMPLES_PER_ITER: usize = 50000; // Samples per policy evaluation
-const LAMBDA_REG: f64 = 1e-5; // Regularization
-const LAMBDA_TD: f64 = 0.40; // Trace decay factor
+const LAMBDA_REG: f64 = 10.0; // Regularization
+const LAMBDA_TD: f64 = 0.00; // Trace decay factor
 
 pub const CONVERGENCE_TOLERANCE: f64 = 1e-5;
 pub const MAX_POLICY_ITERS: usize = 10;
@@ -365,3 +365,5 @@ pub fn calculate_k(
 
     k_trust
 }
+
+// try more or different noise, add constant feature

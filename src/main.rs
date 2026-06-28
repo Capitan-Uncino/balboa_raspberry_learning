@@ -11,7 +11,7 @@ mod graphic_utils;
 #[cfg(feature = "sim")]
 mod sim;
 
-use batch_analisys::single_batch_multiple_iterations::run_offline_computation_mode;
+use batch_analisys::single_batch_analisys::run_offline_computation_mode;
 use clap::Parser;
 use robot_comunication::i2c_comunication_external_controller::{
     run_data_collection_mode, run_online_mode,
@@ -27,7 +27,7 @@ use sim::mujoco_sim::{run_data_collection_mode_sim, run_online_mode_sim, run_sim
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Run in online mode
-    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
     online: bool,
 
     /// Run a new batch for data collection
@@ -35,7 +35,7 @@ struct Args {
     new_batch: bool,
 
     /// Enable simulation mode
-    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
     sim: bool,
 
     /// Enable visualization
@@ -43,7 +43,7 @@ struct Args {
     visualize: bool,
 
     /// Enable plotting
-    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
     plot: bool,
 }
 
