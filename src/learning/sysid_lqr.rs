@@ -1,27 +1,26 @@
 use nalgebra::{DMatrix, SMatrix, SVector};
 
-//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
-//
-pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
+//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
+pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
 pub const DT: f64 = 0.01;
 
-pub const Q_COST: [f64; 4] = [10.0, 100.0, 2.0, 5.0];
+pub const Q_COST: [f64; 4] = [10.0, 100.0, 0.0, 0.1];
 pub const R_COST: [f64; 1] = [3.0];
 
 // --- System Dimensions ---
 pub const DIM_X: usize = 4;
 pub const DIM_U: usize = 1;
 const DIM_X_AND_U: usize = DIM_X + DIM_U;
-const DIM_PARAMS: usize = (DIM_X_AND_U * (DIM_X_AND_U + 1)) / 2;
-pub const DEBUG: bool = false;
-pub const SAMPLES_PER_ITER: usize = 50000; // Samples per policy evaluation
+pub const DEBUG: bool = true;
+pub const SAMPLES_PER_ITER: usize = 50000; // Now completely safe to use
 
 fn spectral_radius(
     a_mat: &SMatrix<f64, DIM_X, DIM_X>,
     b_mat: &SMatrix<f64, DIM_X, DIM_U>,
     k: &SMatrix<f64, DIM_U, DIM_X>,
 ) -> f64 {
-    let a_cl = a_mat - b_mat * k;
+    // Under u = Kx convention, closed loop is A + BK
+    let a_cl = a_mat + b_mat * k;
     let eig = a_cl.complex_eigenvalues();
     eig.iter()
         .map(|c| c.norm())
@@ -60,7 +59,7 @@ pub fn estimate_system_dynamics_closed_loop(
         let state_vec =
             SVector::<f64, DIM_X>::new(t_curr.phi, t_curr.theta, t_curr.phi_dot, t_curr.theta_dot);
 
-        // 2. Reconstruct the pure exploration noise (u = Kx convention)
+        // 2. Reconstruct pure exploration noise (u = Kx convention)
         // u_total = K * x + noise  =>  noise = u_total - K * x
         let u_control = (current_k * state_vec)[0];
         let pure_noise = t_curr.u - u_control;
@@ -79,12 +78,20 @@ pub fn estimate_system_dynamics_closed_loop(
         x_next[(3, i)] = t_next.theta_dot;
     }
 
-    // 4. Solve for Theta = [A_cl  B] using SVD
-    let x_curr_t = x_curr.transpose();
-    let x_next_t = x_next.transpose();
+    // 4. Solve for Theta = [A_cl  B] using Normal Equations instead of SVD
+    // This avoids a 50,000 x 50,000 memory allocation!
+    let x_curr_t = x_curr.transpose(); // Size: N x 5
+    let x_next_t = x_next.transpose(); // Size: N x 4
 
-    let svd = x_curr_t.svd(true, true);
-    let theta_t = svd.solve(&x_next_t, 1e-7).expect("SVD Resolution failed");
+    // (X^T * X) is a tiny 5x5 matrix. (X^T * Y) is a 5x4 matrix.
+    let xt_x = &x_curr * &x_curr_t;
+    let xt_y = &x_curr * &x_next_t;
+
+    let theta_t = xt_x
+        .try_inverse()
+        .expect("System ID failed: Data matrix singular (Add more exploration noise)")
+        * xt_y;
+
     let theta = theta_t.transpose();
 
     // 5. Extract A_cl and B
@@ -100,8 +107,8 @@ pub fn estimate_system_dynamics_closed_loop(
         }
     }
 
-    // 6. Recover the true open-loop physical A matrix!
-    // Since A_cl = A + BK  =>  A = A_cl - BK
+    // 6. Recover the true open-loop physical A matrix
+    // Since u = Kx convention, A_cl = A + BK  =>  A = A_cl - BK
     let a_mat = a_cl - b_mat * current_k;
 
     if DEBUG {
@@ -117,8 +124,6 @@ pub fn estimate_system_dynamics_closed_loop(
 // =====================================================================
 // Helper 2: LQR Calculation
 // =====================================================================
-/// Solves the Discrete Algebraic Riccati Equation (DARE) via Value Iteration
-/// to compute the optimal greedy policy gain matrix K.
 pub fn compute_lqr_gain(
     a_mat: &SMatrix<f64, DIM_X, DIM_X>,
     b_mat: &SMatrix<f64, DIM_X, DIM_U>,
@@ -132,7 +137,7 @@ pub fn compute_lqr_gain(
 
     let mut p_mat = q_mat;
     let max_iter = 1000;
-    let tolerance = 1e-6;
+    let tolerance = 1e-9; // Tightened for high-precision inverted pendulum stability
 
     for _ in 0..max_iter {
         let b_t_p = b_mat.transpose() * p_mat;
@@ -151,12 +156,16 @@ pub fn compute_lqr_gain(
         }
     }
 
-    // Compute optimal K: K = (R + B^T P B)^-1 B^T P A
+    // Compute standard optimal K: K_opt = (R + B^T P B)^-1 B^T P A
     let inv_term = (r_mat + b_mat.transpose() * p_mat * b_mat)
         .try_inverse()
         .unwrap();
 
-    inv_term * b_mat.transpose() * p_mat * a_mat
+    let k_opt = inv_term * b_mat.transpose() * p_mat * a_mat;
+
+    // Because your system specifically applies u = Kx (positive feedback),
+    // we must return -K_opt so the resulting control law is actively stabilizing.
+    -k_opt
 }
 
 // =====================================================================
@@ -179,7 +188,8 @@ pub fn calculate_k(
     let k_greedy = compute_lqr_gain(&a_mat, &b_mat);
 
     // 3. Apply Polyak Averaging (Policy-Space Trust Region)
-    let alpha = 1.0;
+    // Dropped from 1.0 to 0.2 to prevent the policy from oscillating drastically
+    let alpha = 0.05;
     let k_trust = current_k * (1.0 - alpha) + k_greedy * alpha;
 
     println!(">>> Trust Region Applied: alpha = {}", alpha);
