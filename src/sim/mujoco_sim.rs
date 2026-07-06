@@ -1,7 +1,8 @@
 use crate::file_utils::get_next_file_index;
 use crate::graphic_utils::plot_cost_evolution;
+use crate::learning::policy::Policy;
 use crate::learning::single_batch_lspi::{
-    calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, Q_COST, R_COST, SAMPLES_PER_ITER,
+    get_policy, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, Q_COST, R_COST, SAMPLES_PER_ITER,
 };
 use crate::logging_utils::log_progress;
 use mujoco_rs::prelude::*;
@@ -41,8 +42,6 @@ pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Er
     let mut viewer =
         MjViewer::launch_passive(&model, 60).expect("Failed to initialize MuJoCo viewer");
 
-    let initial_k_array = ANALYTIC_LQR_POLICY;
-
     let noise = estimate_process_noise(&model, &mut data);
     println!("============================================================");
     println!("       PROCESS NOISE DIAGNOSTIC REPORT");
@@ -50,33 +49,66 @@ pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Er
 
     // 1. Print the Mean Vector (The "Bias")
     println!("MEAN VECTOR (Systematic Bias / Residuals):");
-    println!("  [ φ_dot,     θ_dot,     φ_ddot,    θ_ddot ]");
-    println!(
-        "  [{:+.4e}, {:+.4e}, {:+.4e}, {:+.4e}]",
-        noise.0[0], noise.0[1], noise.0[2], noise.0[3]
-    );
+    if BACKLASH_ESTIMATION {
+        println!("  [ φ_dot,     θ_dot,     φ_ddot,    θ_ddot,    backlash_dot ]");
+        println!(
+            "  [{:+.4e}, {:+.4e}, {:+.4e}, {:+.4e}, {:+.4e}]",
+            noise.0[0], noise.0[1], noise.0[2], noise.0[3], noise.0[4]
+        );
+    } else {
+        println!("  [ φ_dot,     θ_dot,     φ_ddot,    θ_ddot ]");
+        println!(
+            "  [{:+.4e}, {:+.4e}, {:+.4e}, {:+.4e}]",
+            noise.0[0], noise.0[1], noise.0[2], noise.0[3]
+        );
+    }
 
     // 2. Print the Covariance Matrix (The "Variance")
     println!("\nCOVARIANCE MATRIX (Sigma):");
-    println!("            φ_dot           θ_dot           φ_ddot          θ_ddot");
-    let labels = ["φ_dot ", "θ_dot ", "φ_ddot", "θ_ddot"];
-    for i in 0..4 {
+    let labels = if BACKLASH_ESTIMATION {
+        vec![
+            "φ_dot       ",
+            "θ_dot       ",
+            "φ_ddot      ",
+            "θ_ddot      ",
+            "backlash_dot",
+        ]
+    } else {
+        vec!["φ_dot ", "θ_dot ", "φ_ddot", "θ_ddot"]
+    };
+
+    print!("            ");
+    for label in &labels {
+        print!("{:<15}", label.trim());
+    }
+    println!();
+
+    for i in 0..DIM_X {
         print!("{} ", labels[i]);
-        for j in 0..4 {
-            // Alignment is key here to see the diagonal vs off-diagonal
+        for j in 0..DIM_X {
             print!("{:>15.4e} ", noise.1[(i, j)]);
         }
         println!();
     }
-
     println!("============================================================");
 
-    let initial_k_mat =
-        nalgebra::SMatrix::<f64, 1, DIM_X>::from_iterator(initial_k_array.into_iter());
+    // Safely map the baseline policy to the potentially larger DIM_X array (for backlash)
+    let mut baseline_gains = [0.0; DIM_X];
+    let copy_len = std::cmp::min(DIM_X, ANALYTIC_LQR_POLICY.len());
+    baseline_gains[..copy_len].copy_from_slice(&ANALYTIC_LQR_POLICY[..copy_len]);
 
-    let current_k = Arc::new(Mutex::new(initial_k_mat));
-    let pending_gains: Arc<Mutex<Option<[f64; DIM_X]>>> = Arc::new(Mutex::new(None));
-    let mut active_gains = initial_k_array;
+    let initial_policy = Policy::new(
+        move |x| {
+            baseline_gains
+                .iter()
+                .zip(x.iter())
+                .map(|(k, xv)| k * xv)
+                .sum()
+        },
+        Some(baseline_gains),
+    );
+
+    let current_policy = Arc::new(Mutex::new(initial_policy));
 
     let mut computations_completed = 0;
     let mut was_balancing = false;
@@ -93,8 +125,7 @@ pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Er
             "LSTDQ Batch",
             computations_completed,
             &mut was_balancing,
-            &pending_gains,
-            &mut active_gains,
+            current_policy.clone(), // Pass the Arc directly
             visualize,
             enable_noise,
         );
@@ -105,22 +136,21 @@ pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Er
         }
 
         computations_completed += 1;
-        let k_clone = Arc::clone(&current_k);
-        let pending_clone = Arc::clone(&pending_gains);
+        let policy_clone = Arc::clone(&current_policy);
 
         std::thread::spawn(move || {
-            let k_to_use = { *k_clone.lock().unwrap() };
-            let new_k_mat = calculate_k(&batch_to_process, &k_to_use);
+            // Snapshot the current policy to avoid locking during math
+            let snapshot = { policy_clone.lock().unwrap().clone() };
 
+            // Calculate the new linear/non-linear policy
+            let new_policy = get_policy(&batch_to_process, &snapshot);
+
+            // Apply the new policy globally
             {
-                *k_clone.lock().unwrap() = new_k_mat;
+                *policy_clone.lock().unwrap() = new_policy;
             }
 
-            // Dynamically construct the array for pending_gains
-            let new_k_array: [f64; DIM_X] = std::array::from_fn(|i| new_k_mat[(0, i)]);
-
-            *pending_clone.lock().unwrap() = Some(new_k_array);
-            println!(">>> LSTDQ Update: New K vector queued for next SIM window.");
+            println!(">>> LSTDQ Update: New Policy queued for next SIM window.");
         });
     }
 
@@ -143,9 +173,24 @@ pub fn run_data_collection_mode_sim(visualize: bool) -> Result<(), Box<dyn std::
 
     let mut file_index = get_next_file_index();
     let mut was_balancing = false;
-    let dummy_pending_gains: Arc<Mutex<Option<[f64; DIM_X]>>> = Arc::new(Mutex::new(None));
 
-    let mut active_gains = ANALYTIC_LQR_POLICY;
+    // Safely map the baseline policy to the potentially larger DIM_X array (for backlash)
+    let mut baseline_gains = [0.0; DIM_X];
+    let copy_len = std::cmp::min(DIM_X, ANALYTIC_LQR_POLICY.len());
+    baseline_gains[..copy_len].copy_from_slice(&ANALYTIC_LQR_POLICY[..copy_len]);
+
+    let initial_policy = Policy::new(
+        move |x| {
+            baseline_gains
+                .iter()
+                .zip(x.iter())
+                .map(|(k, xv)| k * xv)
+                .sum()
+        },
+        Some(baseline_gains),
+    );
+
+    let current_policy = Arc::new(Mutex::new(initial_policy));
 
     println!(
         "Started [SIMULATED] data collection mode. Will start at index: {}",
@@ -160,8 +205,7 @@ pub fn run_data_collection_mode_sim(visualize: bool) -> Result<(), Box<dyn std::
             "CSV Collection",
             file_index,
             &mut was_balancing,
-            &dummy_pending_gains,
-            &mut active_gains,
+            current_policy.clone(), // Pass the constant policy
             visualize,
             true,
         );
@@ -193,7 +237,6 @@ pub fn run_data_collection_mode_sim(visualize: bool) -> Result<(), Box<dyn std::
     }
     Ok(())
 }
-
 pub fn run_sim_plot(
     visualize: bool,
     evaluation_threshold: f64,
@@ -210,7 +253,21 @@ pub fn run_sim_plot(
     let mut data = model.make_data();
     let mut viewer = MjViewer::launch_passive(&model, 60).expect("Failed to init viewer");
 
-    let initial_k_array = ANALYTIC_LQR_POLICY;
+    // Safely map the baseline policy to the potentially larger DIM_X array (for backlash)
+    let mut baseline_gains = [0.0; DIM_X];
+    let copy_len = std::cmp::min(DIM_X, ANALYTIC_LQR_POLICY.len());
+    baseline_gains[..copy_len].copy_from_slice(&ANALYTIC_LQR_POLICY[..copy_len]);
+
+    let baseline_policy = Policy::new(
+        move |x| {
+            baseline_gains
+                .iter()
+                .zip(x.iter())
+                .map(|(k, xv)| k * xv)
+                .sum()
+        },
+        Some(baseline_gains),
+    );
 
     let noise = estimate_process_noise(&model, &mut data);
 
@@ -266,7 +323,7 @@ pub fn run_sim_plot(
 
     // --- 1. Evaluate the Original Baseline Policy ---
     println!("Evaluating original baseline policy...");
-    let baseline_cost = evaluate_policy_sim(&model, &mut data, initial_k_array, false);
+    let baseline_cost = evaluate_policy_sim(&model, &mut data, baseline_policy.clone(), false);
     println!("Baseline Cost: {:.4}", baseline_cost);
 
     // --- 2. Generate N Policies via Uniform Perturbation ---
@@ -278,13 +335,17 @@ pub fn run_sim_plot(
     )
     .unwrap();
 
-    // Dynamically size the perturbation using from_fn
-    let mut active_policies: Vec<(usize, [f64; DIM_X])> = (0..n_policies)
+    // Dynamically generate the perturbed policies
+    let mut active_policies: Vec<(usize, Policy)> = (0..n_policies)
         .map(|id| {
             let p: [f64; DIM_X] = std::array::from_fn(|i| {
-                initial_k_array[i] * rand::distr::Distribution::sample(&uniform_dist, &mut rng)
+                baseline_gains[i] * rand::distr::Distribution::sample(&uniform_dist, &mut rng)
             });
-            (id, p)
+            let policy = Policy::new(
+                move |x| p.iter().zip(x.iter()).map(|(k, xv)| k * xv).sum(),
+                Some(p),
+            );
+            (id, policy)
         })
         .collect();
 
@@ -299,9 +360,9 @@ pub fn run_sim_plot(
 
         let mut next_active_policies = Vec::new();
 
-        for (p_idx, mut policy) in active_policies {
+        for (p_idx, policy) in active_policies {
             // A) EVALUATION PHASE (Noise OFF)
-            let empirical_cost = evaluate_policy_sim(&model, &mut data, policy, false);
+            let empirical_cost = evaluate_policy_sim(&model, &mut data, policy.clone(), false);
             cost_history[p_idx].push(empirical_cost);
             println!("  Policy {} - Eval Cost: {:.4}", p_idx, empirical_cost);
 
@@ -314,9 +375,8 @@ pub fn run_sim_plot(
             }
 
             // B) BATCH COLLECTION PHASE (Noise ON)
-            let mut active_gains = policy;
-            let pending_gains: std::sync::Arc<std::sync::Mutex<Option<[f64; DIM_X]>>> =
-                std::sync::Arc::new(std::sync::Mutex::new(None));
+            // Arc abstraction handles the concurrent locks natively now
+            let current_policy = std::sync::Arc::new(std::sync::Mutex::new(policy.clone()));
             let mut was_balancing = false;
 
             let batch_to_process = collect_full_batch_sim(
@@ -326,8 +386,7 @@ pub fn run_sim_plot(
                 &format!("LSTDQ P{} U{}", p_idx, update_idx),
                 update_idx,
                 &mut was_balancing,
-                &pending_gains,
-                &mut active_gains,
+                current_policy,
                 visualize,
                 true,
             );
@@ -341,13 +400,9 @@ pub fn run_sim_plot(
             }
 
             // C) UPDATE PHASE (Synchronous)
-            let current_k_mat = nalgebra::SMatrix::<f64, 1, DIM_X>::from_row_slice(&policy);
-            let new_k_mat = calculate_k(&batch_to_process, &current_k_mat);
-
-            // Dynamically extract the new gains back into the array
-            policy = std::array::from_fn(|i| new_k_mat[(0, i)]);
-
-            next_active_policies.push((p_idx, policy));
+            // The get_policy function automatically resolves if the output is LQR or a Neural Net
+            let new_policy = get_policy(&batch_to_process, &policy);
+            next_active_policies.push((p_idx, new_policy));
         }
 
         active_policies = next_active_policies;
@@ -360,7 +415,7 @@ pub fn run_sim_plot(
 
     // --- 4. Final Evaluation ---
     for (p_idx, policy) in active_policies.iter() {
-        let final_cost = evaluate_policy_sim(&model, &mut data, *policy, false);
+        let final_cost = evaluate_policy_sim(&model, &mut data, policy.clone(), false);
         cost_history[*p_idx].push(final_cost);
     }
 
@@ -370,28 +425,33 @@ pub fn run_sim_plot(
     println!("===================================================================================================================");
 
     if BACKLASH_ESTIMATION {
-        println!("| Policy ID | Final Cost |   K1 (φ)        |   K2 (θ)        |   K3 (φ_dot)    |   K4 (θ_dot)    |   K5 (bklsh)    |");
-        println!("|-----------|------------|-----------------|-----------------|-----------------|-----------------|-----------------|");
+        println!("| Policy ID | Final Cost |   K1 (φ)         |   K2 (θ)         |   K3 (φ_dot)     |   K4 (θ_dot)     |   K5 (bklsh)     |");
+        println!("|-----------|------------|------------------|------------------|------------------|------------------|------------------|");
     } else {
-        println!("| Policy ID | Final Cost |   K1 (φ)        |   K2 (θ)        |   K3 (φ_dot)    |   K4 (θ_dot)    |");
-        println!("|-----------|------------|-----------------|-----------------|-----------------|-----------------|");
+        println!("| Policy ID | Final Cost |   K1 (φ)         |   K2 (θ)         |   K3 (φ_dot)     |   K4 (θ_dot)     |");
+        println!("|-----------|------------|------------------|------------------|------------------|------------------|");
     }
 
     if active_policies.is_empty() {
-        println!("|                           No policies survived the evaluation threshold.                                        |");
+        println!("|                            No policies survived the evaluation threshold.                                       |");
     } else {
         for (p_idx, policy) in active_policies.iter() {
             let final_cost = cost_history[*p_idx].last().unwrap_or(&f64::NAN);
 
+            // Extract the real linear gains, or calculate LQR-equivalents if it's a Deep NN
+            let gains = policy
+                .get_gains()
+                .unwrap_or_else(|| policy.get_pseudogains());
+
             if BACKLASH_ESTIMATION {
                 println!(
-                    "| {:^9} | {:^10.4} | {:>15.4} | {:>15.4} | {:>15.4} | {:>15.4} | {:>15.4} |",
-                    p_idx, final_cost, policy[0], policy[1], policy[2], policy[3], policy[4]
+                    "| {:^9} | {:^10.4} | {:>16.4} | {:>16.4} | {:>16.4} | {:>16.4} | {:>16.4} |",
+                    p_idx, final_cost, gains[0], gains[1], gains[2], gains[3], gains[4]
                 );
             } else {
                 println!(
-                    "| {:^9} | {:^10.4} | {:>15.4} | {:>15.4} | {:>15.4} | {:>15.4} |",
-                    p_idx, final_cost, policy[0], policy[1], policy[2], policy[3]
+                    "| {:^9} | {:^10.4} | {:>16.4} | {:>16.4} | {:>16.4} | {:>16.4} |",
+                    p_idx, final_cost, gains[0], gains[1], gains[2], gains[3]
                 );
             }
         }
@@ -409,7 +469,6 @@ pub fn run_sim_plot(
 
     Ok(())
 }
-
 // --- 1. CALCULATE ANALYTICAL A AND B MATRICES ---
 /*
 let mw: f64 = 0.0042;
@@ -459,15 +518,15 @@ pub enum SimTask<'v, 't> {
         log_label: &'t str,
         batch_index: usize,
         was_balancing: &'t mut bool,
-        pending_gains: &'t Arc<Mutex<Option<[f64; DIM_X]>>>,
-        active_gains: &'t mut [f64; DIM_X],
+        current_policy: Arc<Mutex<Policy>>, // <-- Replaced pending/active gains
         enable_rendering: bool,
     },
     EvaluatePolicy {
-        policy_gains: [f64; DIM_X],
+        policy: Policy, // <-- Holds the clonable Policy struct directly
     },
     EstimateProcessNoise,
 }
+
 pub enum SimResult {
     Batch(Vec<StateAction>),
     EvaluationCost(f64),
@@ -510,19 +569,18 @@ pub fn unified_sim_loop<'a, 'v, 't>(
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
     // 1. Setup initial conditions & matrices
-    let (analytical_k, a_mat, b_mat) = setup_simulation(data, &task, &mut rng);
+    // Now returns an analytical Policy instead of a K array
+    let (analytical_policy, a_mat, b_mat) = setup_simulation(data, &task, &mut rng);
 
     println!(">>> [SIM] Running MuJoCo Simulation Loop...");
 
     // --- NEW: Initialize tracking variables for the Hysteresis Estimator ---
-    // Read the initial state to prime the tracking variables
     let (init_phi_left, init_phi_right, init_theta, _, _, _) = extract_state(data, BACKLASH_JOINTS);
     let mut last_phi = (init_phi_left + init_phi_right) / 2.0;
     let mut last_theta = init_theta;
     let mut current_backlash = 0.0;
 
-    // Note: Ensure DEADZONE_EPSILON is in scope (e.g., 1.5 * PI / 180.0)
-    const JUMP_THRESHOLD: f64 = 1.0; // Rads. Used to detect MuJoCo environment resets.
+    const JUMP_THRESHOLD: f64 = 1.0;
 
     // 2. Main Simulation Loop
     for current_step in 0..max_steps {
@@ -539,19 +597,14 @@ pub fn unified_sim_loop<'a, 'v, 't>(
         let phi_dot = (phi_dot_left + phi_dot_right) / 2.0;
 
         // --- NEW: Estimate Backlash via Play Operator ---
-        // 1. Check if MuJoCo reset the robot's pose (discontinuity)
         if (phi - last_phi).abs() > JUMP_THRESHOLD || (theta - last_theta).abs() > JUMP_THRESHOLD {
-            current_backlash = 0.0; // Reset estimator
+            current_backlash = 0.0;
         } else {
-            // 2. Calculate the absolute rotation of the motor shaft in the world
             let delta_abs_motor = (phi - last_phi) + (theta - last_theta);
-
-            // 3. Integrate and clamp to physical limits
             current_backlash =
                 (current_backlash + delta_abs_motor).clamp(-DEADZONE_EPSILON, DEADZONE_EPSILON);
         }
 
-        // Update tracking variables for the next step
         last_phi = phi;
         last_theta = theta;
 
@@ -565,8 +618,8 @@ pub fn unified_sim_loop<'a, 'v, 't>(
             x_k[4] = current_backlash;
         }
 
-        // Compute Control & Physics
-        let u_raw = compute_control_effort(&mut task, &x_k, &analytical_k);
+        // Compute Control using the Policy struct abstraction
+        let u_raw = compute_control_effort(&mut task, &x_k, &analytical_policy);
 
         let (raw_tau, u_applied) = apply_motor_physics(
             data,
@@ -584,7 +637,7 @@ pub fn unified_sim_loop<'a, 'v, 't>(
             data.step();
         }
 
-        // Process Results (Metrics, Logging, Falls, Resets)
+        // Process Results
         let action = process_step_result(
             data,
             &mut task,
@@ -609,7 +662,6 @@ pub fn unified_sim_loop<'a, 'v, 't>(
     // 3. Finalize and Return
     finalize_results(task, tracker, max_steps)
 }
-
 // ==========================================
 // HELPER FUNCTIONS
 // ==========================================
@@ -654,13 +706,12 @@ fn calculate_discrete_lqr(
 fn setup_simulation<'a>(
     data: &mut MjData<&'a MjModel>,
     task: &SimTask,
-    rng: &mut StdRng,
+    rng: &mut rand::rngs::StdRng,
 ) -> (
-    SMatrix<f64, DIM_U, DIM_X>,
+    Policy, // <-- Changed to return a generic Policy
     SMatrix<f64, DIM_X, DIM_X>,
     SMatrix<f64, DIM_X, DIM_U>,
 ) {
-    // These are the dynamically-sized matrices we return to the main loop
     let mut analytical_k_full = SMatrix::<f64, DIM_U, DIM_X>::zeros();
     let mut a_mat_full = SMatrix::<f64, DIM_X, DIM_X>::zeros();
     let mut b_mat_full = SMatrix::<f64, DIM_X, DIM_U>::zeros();
@@ -707,9 +758,6 @@ fn setup_simulation<'a>(
             let k_4d = calculate_discrete_lqr(&a_mat_4d, &b_mat_4d, control_step);
 
             // --- 3. EMBED 4D RESULTS INTO DIM_X MATRICES ---
-            // This maps the 4x4 blocks into the top-left of the potentially 5x5 blocks.
-            // If DIM_X is 5, the 5th row/column remains exactly 0.0,
-            // completely ignoring the backlash state.
             a_mat_full.fixed_view_mut::<4, 4>(0, 0).copy_from(&a_mat_4d);
             b_mat_full.fixed_view_mut::<4, 1>(0, 0).copy_from(&b_mat_4d);
             analytical_k_full
@@ -732,6 +780,23 @@ fn setup_simulation<'a>(
         _ => {}
     }
 
+    // Convert the computed analytical matrix (or zero matrix) into a generic Policy
+    let explicit_gains = [
+        analytical_k_full[(0, 0)],
+        analytical_k_full[(0, 1)],
+        analytical_k_full[(0, 2)],
+        analytical_k_full[(0, 3)],
+    ];
+    let analytical_policy = Policy::new(
+        move |x| {
+            explicit_gains[0] * x[0]
+                + explicit_gains[1] * x[1]
+                + explicit_gains[2] * x[2]
+                + explicit_gains[3] * x[3]
+        },
+        Some(explicit_gains),
+    );
+
     // Reset robot to random upright pose
     data.reset();
     data.qpos_mut()[2] = 0.05;
@@ -740,9 +805,8 @@ fn setup_simulation<'a>(
     data.qpos_mut()[5] = (initial_theta / 2.0).sin();
     data.qvel_mut()[4] = rng.random_range(-0.1..0.1);
 
-    (analytical_k_full, a_mat_full, b_mat_full)
+    (analytical_policy, a_mat_full, b_mat_full)
 }
-
 fn should_exit_early(task: &SimTask, tracker: &SimTracker) -> bool {
     match task {
         SimTask::CollectBatch {
@@ -760,30 +824,22 @@ fn should_exit_early(task: &SimTask, tracker: &SimTracker) -> bool {
 fn compute_control_effort(
     task: &mut SimTask,
     x_k: &SVector<f64, DIM_X>,
-    analytical_k: &SMatrix<f64, DIM_U, DIM_X>,
+    analytical_policy: &Policy,
 ) -> f64 {
     match task {
-        SimTask::CollectBatch {
-            pending_gains,
-            active_gains,
-            ..
-        } => {
-            if let Some(new_gains) = pending_gains.lock().unwrap().take() {
-                **active_gains = new_gains;
-            }
-            // Dot product between active gains and current state
-            active_gains
-                .iter()
-                .zip(x_k.iter())
-                .map(|(k, x)| k * x)
-                .sum()
+        SimTask::CollectBatch { current_policy, .. } => {
+            // Briefly lock the Mutex, get the action from the native Policy, and release
+            let policy = current_policy.lock().unwrap();
+            policy.get_action(x_k)
         }
-        SimTask::EvaluatePolicy { policy_gains } => policy_gains
-            .iter()
-            .zip(x_k.iter())
-            .map(|(k, x)| k * x)
-            .sum(),
-        SimTask::EstimateProcessNoise => (analytical_k * x_k)[(0, 0)],
+        SimTask::EvaluatePolicy { policy } => {
+            // Directly evaluate the owned policy clone
+            policy.get_action(x_k)
+        }
+        SimTask::EstimateProcessNoise => {
+            // Use the fallback analytical policy
+            analytical_policy.get_action(x_k)
+        }
     }
 }
 
@@ -907,7 +963,6 @@ fn process_step_result<'a>(
                         theta,
                         phi_dot,
                         theta_dot,
-                        //backlash, // <--- ADDED HERE
                         u: raw_tau,
                     });
                     tracker.loop_counter += 1;
@@ -953,8 +1008,6 @@ fn process_step_result<'a>(
         SimTask::EstimateProcessNoise => {
             let (pl, pr, t, pdl, pdr, td) = extract_state(data, BACKLASH_JOINTS);
 
-            // Build the next state vector dynamically to prevent panics
-            // when mapping arrays to DIM_X
             let mut x_k1 = SVector::<f64, DIM_X>::zeros();
             x_k1[0] = (pl + pr) / 2.0;
             x_k1[1] = t;
@@ -966,10 +1019,7 @@ fn process_step_result<'a>(
             }
 
             let x_dot_empirical = (x_k1 - x_k) / control_step;
-
-            // Note: DIM_U shouldn't change, so from_column_slice here is safe
             let u_applied_vec = SVector::<f64, DIM_U>::from_column_slice(&[u_applied]);
-
             let x_dot_theory = (a_mat * x_k) + (b_mat * u_applied_vec);
 
             tracker.noises.push(x_dot_empirical - x_dot_theory);
@@ -1010,8 +1060,7 @@ pub fn collect_full_batch_sim<'a, 'v, 't>(
     log_label: &'t str,
     batch_index: usize,
     was_balancing: &'t mut bool,
-    pending_gains: &'t Arc<Mutex<Option<[f64; DIM_X]>>>,
-    active_gains: &'t mut [f64; DIM_X],
+    current_policy: Arc<Mutex<Policy>>, // <-- Now expects the Arc directly
     enable_rendering: bool,
     enable_noise: bool,
 ) -> Vec<StateAction> {
@@ -1020,8 +1069,7 @@ pub fn collect_full_batch_sim<'a, 'v, 't>(
         log_label,
         batch_index,
         was_balancing,
-        pending_gains,
-        active_gains,
+        current_policy,
         enable_rendering,
     };
 
@@ -1049,10 +1097,10 @@ pub fn estimate_process_noise<'a>(
 pub fn evaluate_policy_sim<'a>(
     model: &'a MjModel,
     data: &mut MjData<&'a MjModel>,
-    policy_gains: [f64; DIM_X],
+    policy: Policy, // <-- Takes the generic Policy struct
     enable_noise: bool,
 ) -> f64 {
-    let task = SimTask::EvaluatePolicy { policy_gains };
+    let task = SimTask::EvaluatePolicy { policy };
 
     match unified_sim_loop(model, data, task, enable_noise) {
         SimResult::EvaluationCost(cost) => cost,

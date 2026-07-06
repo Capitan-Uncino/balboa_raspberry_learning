@@ -1,3 +1,4 @@
+use crate::learning::policy::Policy;
 use nalgebra::{DMatrix, SMatrix, SVector};
 
 //pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
@@ -12,7 +13,7 @@ pub const DIM_X: usize = 4;
 pub const DIM_U: usize = 1;
 const DIM_X_AND_U: usize = DIM_X + DIM_U;
 pub const DEBUG: bool = true;
-pub const SAMPLES_PER_ITER: usize = 50000; // Now completely safe to use
+pub const SAMPLES_PER_ITER: usize = 10000;
 
 fn spectral_radius(
     a_mat: &SMatrix<f64, DIM_X, DIM_X>,
@@ -171,32 +172,48 @@ pub fn compute_lqr_gain(
 // =====================================================================
 // Main Policy Update Function
 // =====================================================================
-pub fn calculate_k(
-    batch: &[StateAction],
-    current_k: &SMatrix<f64, DIM_U, DIM_X>,
-) -> SMatrix<f64, DIM_U, DIM_X> {
-    // 1. System Identification
-    let (a_mat, b_mat) = match estimate_system_dynamics_closed_loop(batch, current_k) {
-        Some(dynamics) => dynamics,
+
+pub fn get_policy(batch: &[StateAction], current_policy: &Policy) -> Policy {
+    // 1. Extract the explicit gains array, panicking if it's a non-linear policy
+    let gains_array = current_policy
+        .get_gains()
+        .expect("Input policy must be linear (explicit gains must be Some)");
+
+    // Reconstruct the SMatrix for mathematical operations
+    let current_k = nalgebra::SMatrix::<f64, DIM_U, DIM_X>::from_row_slice(&gains_array);
+
+    // 2. Determine the final K matrix
+    let k_final = match estimate_system_dynamics_closed_loop(batch, &current_k) {
+        Some((a_mat, b_mat)) => {
+            // Compute Greedy LQR Policy
+            let k_greedy = compute_lqr_gain(&a_mat, &b_mat);
+
+            // Apply Polyak Averaging (Policy-Space Trust Region)
+            let alpha = 1.0;
+            let k_trust = current_k * (1.0 - alpha) + k_greedy * alpha;
+
+            println!(">>> Trust Region Applied: alpha = {}", alpha);
+            println!(
+                ">>> Spectral Radius: {:.4}",
+                spectral_radius(&a_mat, &b_mat, &k_trust)
+            );
+
+            k_trust
+        }
         None => {
             eprintln!("Batch too small for System ID. Returning current K.");
-            return *current_k;
+            current_k // Copy the current K to be used as k_final
         }
     };
 
-    // 2. Compute Greedy LQR Policy
-    let k_greedy = compute_lqr_gain(&a_mat, &b_mat);
+    // 3. Extract the resulting matrix back into an array to store in the Policy struct
+    let explicit_array = [
+        k_final[(0, 0)],
+        k_final[(0, 1)],
+        k_final[(0, 2)],
+        k_final[(0, 3)],
+    ];
 
-    // 3. Apply Polyak Averaging (Policy-Space Trust Region)
-    // Dropped from 1.0 to 0.2 to prevent the policy from oscillating drastically
-    let alpha = 0.05;
-    let k_trust = current_k * (1.0 - alpha) + k_greedy * alpha;
-
-    println!(">>> Trust Region Applied: alpha = {}", alpha);
-    println!(
-        ">>> Spectral Radius: {:.4}",
-        spectral_radius(&a_mat, &b_mat, &k_trust)
-    );
-
-    k_trust
+    // 4. Return the encapsulated Policy
+    Policy::new(move |x| (k_final * x)[0], Some(explicit_array))
 }

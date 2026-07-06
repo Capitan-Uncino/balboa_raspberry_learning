@@ -1,4 +1,5 @@
-use crate::learning::sysid_lqr::{calculate_k, StateAction, ANALYTIC_LQR_POLICY};
+use crate::learning::policy::Policy;
+use crate::learning::sysid_lqr::{get_policy, StateAction, ANALYTIC_LQR_POLICY};
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -39,19 +40,48 @@ pub fn run_offline_computation_mode() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    println!("Loaded {} records. Computing K...", batch.len());
+    println!("Loaded {} records. Computing new Policy...", batch.len());
 
-    // Provide the initial K matrix required for computation
-    let initial_k_mat =
-        nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(ANALYTIC_LQR_POLICY.as_slice());
+    // 1. Initialize the starting Policy struct with analytic explicit gains
+    let initial_k_array = [
+        ANALYTIC_LQR_POLICY[0],
+        ANALYTIC_LQR_POLICY[1],
+        ANALYTIC_LQR_POLICY[2],
+        ANALYTIC_LQR_POLICY[3],
+    ];
+    let initial_policy = Policy::new(
+        move |x| {
+            let k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&initial_k_array);
+            (k_mat * x)[0]
+        },
+        Some(initial_k_array),
+    );
 
-    // Call the computation algorithm
-    let new_k_mat = calculate_k(&batch, &initial_k_mat);
+    // 2. Call the computation algorithm
+    let new_policy = get_policy(&batch, &initial_policy);
 
+    // 3. Extract the gains to display them to the user
     println!("========================================");
-    println!(">>> COMPUTED K MATRIX RESULT <<<");
-    println!("{}", new_k_mat);
+    println!(">>> COMPUTED POLICY RESULT <<<");
+
+    if let Some(gains) = new_policy.get_gains() {
+        println!("Type: Linear LQR (Explicit Matrix)");
+        println!(
+            "K_PHI: {:.6}, K_THETA: {:.6}, K_PHIDOT: {:.6}, K_THETADOT: {:.6}",
+            gains[0], gains[1], gains[2], gains[3]
+        );
+    } else {
+        let pseudogains = new_policy.get_pseudogains();
+        println!("Type: Non-Linear Network (IQL)");
+        println!("Local LQR Approximation (Evaluated at equilibrium):");
+        println!(
+            "K_PHI: {:.6}, K_THETA: {:.6}, K_PHIDOT: {:.6}, K_THETADOT: {:.6}",
+            pseudogains[0], pseudogains[1], pseudogains[2], pseudogains[3]
+        );
+    }
+
     println!("========================================");
 
     Ok(())
 }
+

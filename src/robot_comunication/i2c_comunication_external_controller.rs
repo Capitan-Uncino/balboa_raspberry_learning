@@ -1,6 +1,7 @@
 use crate::file_utils::get_next_file_index;
-use crate::learning::sysid_lqr::{
-    calculate_k, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, Q_COST, R_COST, SAMPLES_PER_ITER,
+use crate::learning::policy::Policy;
+use crate::learning::single_batch_lspi::{
+    get_policy, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, Q_COST, R_COST, SAMPLES_PER_ITER,
 };
 use crate::logging_utils::log_progress;
 use chrono::Local;
@@ -403,7 +404,7 @@ fn process_measurements(
 
 fn compute_control_action(
     state: &mut ProcessedState,
-    current_k: Arc<Mutex<nalgebra::SMatrix<f64, 1, 4>>>,
+    current_policy: Arc<Mutex<Policy>>, // <-- Changed from SMatrix to Policy
     balancing: &bool,
     avoid_oscillations: bool,
     enable_noise: bool,
@@ -413,27 +414,36 @@ fn compute_control_action(
         return (0.0, 0, 0);
     }
 
-    let k = current_k.lock().unwrap();
-    let mut u_physical = if enable_balance_angle_compensation {
-        k[(0, 0)] * state.phi
-            + k[(0, 1)] * (state.theta - BALANCE_ANGLE_RADIANS)
-            + k[(0, 2)] * state.phi_dot
-            + k[(0, 3)] * state.theta_dot
+    // 1. Construct the state vector for the Policy
+    let theta_input = if enable_balance_angle_compensation {
+        state.theta - BALANCE_ANGLE_RADIANS
     } else {
-        k[(0, 0)] * state.phi
-            + k[(0, 1)] * state.theta
-            + k[(0, 2)] * state.phi_dot
-            + k[(0, 3)] * state.theta_dot
+        state.theta
     };
 
+    let x = nalgebra::SVector::<f64, DIM_X>::new(
+        state.phi,
+        theta_input,
+        state.phi_dot,
+        state.theta_dot,
+    );
+
+    // 2. Query the policy (Agnostic to whether it's LQR or a Neural Network)
+    // The lock is strictly scoped so it drops immediately after getting the action
+    let mut u_physical = {
+        let policy = current_policy.lock().unwrap();
+        policy.get_action(&x)
+    };
+
+    // --- The rest remains completely unchanged ---
     if enable_noise {
         let sigma_ou = 0.60;
         let theta_ou = 0.60;
         let dt: f64 = 0.01;
 
         let mut rng = rand::rng();
-        let normal = Normal::new(0.0, 1.0).unwrap();
-        let standard_normal = normal.sample(&mut rng);
+        let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+        let standard_normal = rand_distr::Distribution::sample(&normal, &mut rng);
 
         // Euler-Maruyama discretization of the Ornstein-Uhlenbeck process
         // dX_t = -theta * X_t * dt + sigma * dW_t
@@ -442,14 +452,17 @@ fn compute_control_action(
 
         u_physical += state.ou_noise;
     }
+
     let u_left = u_physical
         - (state.phi_diff * K_LATERAL_P
             + state.phi_diff_i * K_LATERAL_I
             + state.phi_diff_d * K_LATERAL_D);
+
     let u_right = u_physical
         + (state.phi_diff * K_LATERAL_P
             + state.phi_diff_i * K_LATERAL_I
             + state.phi_diff_d * K_LATERAL_D);
+
     let mut v_batt = state.battery_mv as f64 / 1000.0;
     if v_batt < 1.0 {
         v_batt = 7.4;
@@ -493,7 +506,7 @@ pub fn collect_full_batch(
     i2c_bus: &Arc<Mutex<I2c>>,
     log_label: &str,
     batch_index: usize,
-    current_k: Arc<Mutex<nalgebra::SMatrix<f64, 1, 4>>>,
+    current_policy: Arc<Mutex<Policy>>,
     raw: &mut RawMeasurements,
     state: &mut ProcessedState,
     batch_size: usize,
@@ -582,14 +595,17 @@ pub fn collect_full_batch(
 
             // --- TIMED: CONTROL COMPUTE ---
             let t_control = Instant::now();
+
+            // Pass the cloned policy instead of current_k
             let (u_avg, speed_left, speed_right) = compute_control_action(
                 &mut current_state,
-                current_k.clone(),
+                current_policy.clone(),
                 was_balancing,
                 false,
                 enable_noise,
                 complementary_filter,
             );
+
             let d_control = t_control.elapsed();
             if d_control.as_micros() > 1000 {
                 eprintln!(
@@ -761,14 +777,28 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let initial_k_mat = SMatrix::<f64, 1, 4>::from_row_slice(&ANALYTIC_LQR_POLICY);
-    let current_k = Arc::new(Mutex::new(initial_k_mat));
+    // Initialize the starting Policy struct with analytic explicit gains
+    let initial_k_array = [
+        ANALYTIC_LQR_POLICY[0],
+        ANALYTIC_LQR_POLICY[1],
+        ANALYTIC_LQR_POLICY[2],
+        ANALYTIC_LQR_POLICY[3],
+    ];
+    let initial_policy = Policy::new(
+        move |x| {
+            let k_mat = SMatrix::<f64, 1, 4>::from_row_slice(&initial_k_array);
+            (k_mat * x)[0]
+        },
+        Some(initial_k_array),
+    );
+
+    let current_policy = Arc::new(Mutex::new(initial_policy));
 
     let mut computations_completed = 0;
     println!("\x1b[36m[INFO]\x1b[0m Starting 100Hz I2C control loop...");
 
     let mut balancing = false;
-    let (k_tx, k_rx) = std::sync::mpsc::channel();
+    let (k_tx, k_rx) = std::sync::mpsc::channel::<Policy>();
 
     let mut last_loop_end = Instant::now();
 
@@ -783,7 +813,7 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
             &i2c_bus,
             "Reposition Robot if necessary",
             computations_completed,
-            current_k.clone(),
+            current_policy.clone(),
             &mut measures,
             &mut state,
             SAMPLES_PER_ITER / 20,
@@ -795,7 +825,7 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
             &i2c_bus,
             "Train Batch",
             computations_completed,
-            current_k.clone(),
+            current_policy.clone(),
             &mut measures,
             &mut state,
             SAMPLES_PER_ITER,
@@ -803,7 +833,8 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
             &mut balancing,
         );
 
-        let k_to_use = { *current_k.lock().unwrap() };
+        // Take a cheap, native snapshot of the current Policy
+        let policy_snapshot = { current_policy.lock().unwrap().clone() };
         let k_tx_clone = k_tx.clone();
 
         // --- TIMED: MATH THREAD SPAWN ---
@@ -814,9 +845,12 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
                     core_affinity::set_for_current(core_ids[1]);
                 }
             }
-            let new_k_mat = calculate_k(&big_batch, &k_to_use);
-            let _ = k_tx_clone.send(new_k_mat);
+
+            // Pass the native Policy object directly
+            let new_policy = get_policy(&big_batch, &policy_snapshot);
+            let _ = k_tx_clone.send(new_policy);
         });
+
         let d_spawn_math = t_spawn_math.elapsed();
         if d_spawn_math.as_millis() > 2 {
             eprintln!(
@@ -829,7 +863,7 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
             &i2c_bus,
             "Reposition Robot if necessary",
             computations_completed,
-            current_k.clone(),
+            current_policy.clone(),
             &mut measures,
             &mut state,
             SAMPLES_PER_ITER / 20,
@@ -837,13 +871,14 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
             &mut balancing,
         );
 
-        let k_eval_snapshot = { *current_k.lock().unwrap() };
+        // Take another snapshot for the CSV thread
+        let eval_policy_snapshot = { current_policy.lock().unwrap().clone() };
 
         let small_batch = collect_full_batch(
             &i2c_bus,
             "Eval Batch",
             computations_completed,
-            current_k.clone(),
+            current_policy.clone(),
             &mut measures,
             &mut state,
             SAMPLES_PER_ITER / 5,
@@ -854,16 +889,16 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
         // --- TIMED: CHANNEL RECEIVE ---
         let t_recv = Instant::now();
         match k_rx.recv() {
-            Ok(new_k_mat) => {
+            Ok(new_policy) => {
                 {
-                    *current_k.lock().unwrap() = new_k_mat;
+                    *current_policy.lock().unwrap() = new_policy;
                 }
                 println!(
-                    "\x1b[36m[UPDATE]\x1b[0m Main Thread: New K matrix applied & sent to Arduino."
+                    "\x1b[36m[UPDATE]\x1b[0m Main Thread: New Policy applied & sent to Arduino."
                 );
             }
             Err(_) => {
-                eprintln!("\x1b[31m[ERROR]\x1b[0m Math thread failed to send K matrix.");
+                eprintln!("\x1b[31m[ERROR]\x1b[0m Math thread failed to send new Policy.");
             }
         }
         let d_recv = t_recv.elapsed();
@@ -911,10 +946,14 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
             let avg_cost = total_cost / small_batch.len() as f64;
             let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
 
-            let k0 = k_eval_snapshot[(0, 0)];
-            let k1 = k_eval_snapshot[(0, 1)];
-            let k2 = k_eval_snapshot[(0, 2)];
-            let k3 = k_eval_snapshot[(0, 3)];
+            // The CSV thread dynamically resolves the logging values here natively
+            let k_log = eval_policy_snapshot
+                .get_gains()
+                .unwrap_or_else(|| eval_policy_snapshot.get_pseudogains());
+            let k0 = k_log[0];
+            let k1 = k_log[1];
+            let k2 = k_log[2];
+            let k3 = k_log[3];
 
             match OpenOptions::new()
                 .create(true)
@@ -936,6 +975,7 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
                 Err(e) => eprintln!("\x1b[31m[ERROR]\x1b[0m Failed to open cost CSV: {:?}", e),
             }
         });
+
         let d_spawn_csv = t_spawn_csv.elapsed();
         if d_spawn_csv.as_millis() > 2 {
             eprintln!(
@@ -944,8 +984,6 @@ pub fn run_online_mode() -> Result<(), Box<dyn Error>> {
             );
         }
 
-        // Mark the time immediately before the loop scope ends
-        // Any implicit memory Drops happen right after this line.
         last_loop_end = Instant::now();
     }
 }
@@ -963,9 +1001,22 @@ pub fn run_data_collection_mode() -> Result<(), Box<dyn Error>> {
     let mut current_file_index = file_index;
     let data_dir = "collected_data";
 
-    let k = Arc::new(Mutex::new(nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(
-        &ANALYTIC_LQR_POLICY,
-    )));
+    // Initialize the starting Policy struct with analytic explicit gains
+    let initial_k_array = [
+        ANALYTIC_LQR_POLICY[0],
+        ANALYTIC_LQR_POLICY[1],
+        ANALYTIC_LQR_POLICY[2],
+        ANALYTIC_LQR_POLICY[3],
+    ];
+    let initial_policy = Policy::new(
+        move |x| {
+            let k_mat = nalgebra::SMatrix::<f64, 1, 4>::from_row_slice(&initial_k_array);
+            (k_mat * x)[0]
+        },
+        Some(initial_k_array),
+    );
+
+    let k = Arc::new(Mutex::new(initial_policy));
 
     println!(
         "\x1b[36m[INFO]\x1b[0m Started data collection. Start index: {}",

@@ -1,10 +1,11 @@
 pub mod backlash_estimating_lstdq;
-//pub mod implicit_q_learning;
+pub mod implicit_q_learning;
 pub mod lstdq;
 pub mod lstdq_2019;
 pub mod lstdq_lambda;
 pub mod lstdq_lambda_standardized;
 pub mod lstdq_lambda_standardized_polyak;
 pub mod lstdq_no_bias_correction;
+pub mod policy;
 pub mod single_batch_lspi;
 pub mod sysid_lqr;

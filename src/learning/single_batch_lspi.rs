@@ -1,5 +1,5 @@
+use crate::learning::policy::Policy;
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
-
 //pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
 pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
 
@@ -310,12 +310,17 @@ fn run_lstdq(batch: &[StateAction], k: &SMatrix<f64, DIM_U, DIM_X>) -> SVector<f
     q_params
 }
 
-pub fn calculate_k(
-    batch: &[StateAction],
-    initial_k: &SMatrix<f64, DIM_U, DIM_X>,
-) -> SMatrix<f64, DIM_U, DIM_X> {
+pub fn get_policy(batch: &[StateAction], current_policy: &Policy) -> Policy {
+    // 1. Extract the explicit gains array, panicking if it's a non-linear policy
+    let gains_array = current_policy
+        .get_gains()
+        .expect("Input policy must be linear (explicit gains must be Some)");
+
+    // Reconstruct the SMatrix for mathematical operations
+    let current_k = nalgebra::SMatrix::<f64, DIM_U, DIM_X>::from_row_slice(&gains_array);
+
     // Helper closure to map the 4 matrix elements to their respective names
-    let format_policy = |k: &SMatrix<f64, DIM_U, DIM_X>| {
+    let format_policy = |k: &nalgebra::SMatrix<f64, DIM_U, DIM_X>| {
         format!(
             "K_PHI: {:.6}, K_THETA: {:.6}, K_PHIDOT: {:.6}, K_THETADOT: {:.6}",
             k[0], k[1], k[2], k[3]
@@ -323,19 +328,19 @@ pub fn calculate_k(
     };
 
     println!("--- Initial Policy ---");
-    println!("{}", format_policy(initial_k));
+    println!("{}", format_policy(&current_k));
 
-    let mut current_k = *initial_k;
-    let mut k_last = current_k;
+    let mut working_k = current_k;
+    let mut k_last = working_k;
 
-    // 1. Repeat LSTDQ and Policy Improvement until convergence
+    // 2. Repeat LSTDQ and Policy Improvement until convergence
     for iter in 0..MAX_POLICY_ITERS {
-        let theta = run_lstdq(batch, &current_k);
+        let theta = run_lstdq(batch, &working_k);
         let h_mat = theta_to_h(&theta);
         let k_greedy = compute_k_from_h(&h_mat);
 
         // Calculate the norm of the difference to check for convergence
-        let diff = (&k_greedy - &current_k).norm();
+        let diff = (&k_greedy - &working_k).norm();
         println!("Policy Iteration {}: diff norm = {:.6}", iter, diff);
 
         // Print the policy after this iteration
@@ -348,22 +353,29 @@ pub fn calculate_k(
             break;
         }
 
-        // Update current_k for the next iteration
-        current_k = k_greedy;
+        // Update working_k for the next iteration
+        working_k = k_greedy;
     }
 
-    // 2. Apply Polyak Averaging (Policy-Space Trust Region)
-    // alpha determines the step size. 0.1 means we move 10% towards the new optimum.
-    let alpha = 0.05;
+    // 3. Apply Polyak Averaging (Policy-Space Trust Region)
+    // alpha determines the step size. 0.5 means we move 50% towards the new optimum.
+    let alpha = 0.5;
 
     // K_new = (1 - \alpha) * K_initial + \alpha * K_last
-    let k_trust = initial_k * (1.0 - alpha) + k_last * alpha;
+    let k_trust = current_k * (1.0 - alpha) + k_last * alpha;
 
     println!(">>> Trust Region Applied: alpha = {}", alpha);
     println!("--- Final Policy (After Polyak Averaging) ---");
     println!("{}", format_policy(&k_trust));
 
-    k_trust
-}
+    // 4. Extract the resulting matrix back into an array to store in the Policy struct
+    let explicit_array = [
+        k_trust[(0, 0)],
+        k_trust[(0, 1)],
+        k_trust[(0, 2)],
+        k_trust[(0, 3)],
+    ];
 
-// try more or different noise, add constant feature
+    // 5. Return the encapsulated Policy
+    Policy::new(move |x| (k_trust * x)[0], Some(explicit_array))
+}
