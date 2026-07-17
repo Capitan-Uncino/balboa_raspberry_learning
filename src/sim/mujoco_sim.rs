@@ -1,9 +1,9 @@
 use crate::file_utils::get_next_file_index;
 use crate::graphic_utils::plot_cost_evolution;
-use crate::learning::policy::Policy;
-use crate::learning::single_batch_lspi::{
+use crate::learning::implicit_q_learning::{
     get_policy, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, Q_COST, R_COST, SAMPLES_PER_ITER,
 };
+use crate::learning::policy::Policy;
 use crate::logging_utils::log_progress;
 use mujoco_rs::prelude::*;
 use mujoco_rs::viewer::MjViewer;

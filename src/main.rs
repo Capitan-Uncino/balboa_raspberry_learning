@@ -27,7 +27,7 @@ use sim::mujoco_sim::{run_data_collection_mode_sim, run_online_mode_sim, run_sim
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Run in online mode
-    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     online: bool,
 
     /// Run a new batch for data collection
@@ -35,7 +35,7 @@ struct Args {
     new_batch: bool,
 
     /// Enable simulation mode
-    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     sim: bool,
 
     /// Enable visualization
@@ -43,7 +43,7 @@ struct Args {
     visualize: bool,
 
     /// Enable plotting
-    #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     plot: bool,
 }
 
@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             #[cfg(feature = "sim")]
             {
                 if args.plot {
-                    run_sim_plot(args.visualize, 50.0, 5, 4, 0.5)?;
+                    run_sim_plot(args.visualize, 50.0, 1, 3, 0.5)?;
                 } else {
                     run_online_mode_sim(args.visualize)?;
                 }
