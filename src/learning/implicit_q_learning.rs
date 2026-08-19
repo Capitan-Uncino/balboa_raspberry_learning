@@ -8,8 +8,9 @@ use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::backend::Backend;
 use burn::tensor::backend::BackendTypes;
 use burn::tensor::{Tensor, TensorData};
-use nalgebra::{SMatrix, SVector};
+use nalgebra::SVector;
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 
 pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
 pub const SAMPLES_PER_ITER: usize = 50000;
@@ -38,6 +39,15 @@ pub struct MlpNetwork<B: Backend> {
     layer2: Linear<B>,
     output_layer: Linear<B>,
     activation: Relu,
+}
+
+pub struct IqlModelState {
+    pub actor: <MlpNetwork<B> as Module<B>>::Record,
+    pub critic_q1: <MlpNetwork<B> as Module<B>>::Record,
+    pub critic_q2: <MlpNetwork<B> as Module<B>>::Record,
+    pub target_q1: <MlpNetwork<B> as Module<B>>::Record,
+    pub target_q2: <MlpNetwork<B> as Module<B>>::Record,
+    pub value_v: <MlpNetwork<B> as Module<B>>::Record,
 }
 
 impl<B: Backend> MlpNetwork<B> {
@@ -170,21 +180,35 @@ fn train_iql_actor(
     t_next_states: Tensor<B, 2>,
     num_transitions: usize,
     device: &<B as BackendTypes>::Device,
-) -> MlpNetwork<B> {
-    // --- 1. NETWORK INITIALIZATION ---
+    previous_state: Option<IqlModelState>,
+) -> (MlpNetwork<B>, IqlModelState) {
     let mut actor = MlpNetwork::<B>::new(DIM_X, 16, DIM_U, device);
     let mut critic_q1 = MlpNetwork::<B>::new(DIM_X + DIM_U, 16, 1, device);
     let mut critic_q2 = MlpNetwork::<B>::new(DIM_X + DIM_U, 16, 1, device);
     let mut value_v = MlpNetwork::<B>::new(DIM_X, 16, 1, device);
+    let mut target_q1 = MlpNetwork::<B>::new(DIM_X + DIM_U, 16, 1, device);
+    let mut target_q2 = MlpNetwork::<B>::new(DIM_X + DIM_U, 16, 1, device);
 
-    // RESTORED: Target Q-Networks for stability
-    let mut target_q1 = critic_q1.clone();
-    let mut target_q2 = critic_q2.clone();
+    // --- RESTORE PREVIOUS STATE IF AVAILABLE ---
+    if let Some(state) = previous_state {
+        println!(">>> Restoring previous IQL networks to resume training...");
+        actor = actor.load_record(state.actor);
+        critic_q1 = critic_q1.load_record(state.critic_q1);
+        critic_q2 = critic_q2.load_record(state.critic_q2);
+        target_q1 = target_q1.load_record(state.target_q1);
+        target_q2 = target_q2.load_record(state.target_q2);
+        value_v = value_v.load_record(state.value_v);
+    } else {
+        // Only mirror the critics to the targets if starting fresh
+        target_q1 = critic_q1.clone();
+        target_q2 = critic_q2.clone();
+    }
 
-    let mut optim_actor = AdamConfig::new().init();
-    let mut optim_q1 = AdamConfig::new().init();
-    let mut optim_q2 = AdamConfig::new().init();
-    let mut optim_v = AdamConfig::new().init();
+    // Explicitly annotate types here to resolve the E0283 error
+    let mut optim_actor = AdamConfig::new().init::<B, MlpNetwork<B>>();
+    let mut optim_q1 = AdamConfig::new().init::<B, MlpNetwork<B>>();
+    let mut optim_q2 = AdamConfig::new().init::<B, MlpNetwork<B>>();
+    let mut optim_v = AdamConfig::new().init::<B, MlpNetwork<B>>();
 
     println!(">>> Starting Original Paper IQL Optimization Loop...");
     let epochs = 30;
@@ -203,7 +227,6 @@ fn train_iql_actor(
             let b_sa = Tensor::cat(vec![b_s.clone(), b_a.clone()], 1);
 
             // --- 2. VALUE UPDATE (Using Target Q-Networks) ---
-            // The paper uses the slow-moving target networks to establish a stable Expectile
             let t_q1_val = target_q1.forward(b_sa.clone());
             let t_q2_val = target_q2.forward(b_sa.clone());
 
@@ -217,7 +240,6 @@ fn train_iql_actor(
             value_v = optim_v.step(LEARNING_RATE, value_v, grads_v_params);
 
             // --- 3. CRITIC UPDATE (Using Live Value Network) ---
-            // The paper uses the live Value network to calculate the Bellman target for Q
             let v_next = value_v.forward(b_s_next);
 
             let q_target = (b_r + v_next.mul_scalar(GAMMA)).detach();
@@ -235,7 +257,6 @@ fn train_iql_actor(
             critic_q2 = optim_q2.step(LEARNING_RATE, critic_q2, grads_q2_params);
 
             // --- 4. ACTOR UPDATE (Using Target Q-Networks) ---
-            // The paper uses the frozen Target Q scores to calculate Advantage
             let advantage = target_q - v_val.detach();
             let weight = (advantage.mul_scalar(IQL_BETA)).clamp_max(10.0).exp();
 
@@ -249,9 +270,6 @@ fn train_iql_actor(
         }
 
         // --- 5. TARGET NETWORK SYNC ---
-        // Rather than a per-step Polyak EMA (which requires heavy parameter-iteration in Burn),
-        // we execute a "Hard Update" once per epoch. This is mathematically sound for offline RL
-        // and much lighter on CPU/RAM overhead for the Pi.
         target_q1 = target_q1.load_record(critic_q1.clone().into_record());
         target_q2 = target_q2.load_record(critic_q2.clone().into_record());
 
@@ -275,11 +293,22 @@ fn train_iql_actor(
         let _ = io::stdout().flush();
     }
 
-    println!(">>> IQL Compilation Complete. Secondary networks freed.");
-    actor
+    println!(">>> IQL Compilation Complete. Packing secondary networks for storage.");
+
+    // --- BUNDLE STATE FOR RETURN ---
+    let new_state = IqlModelState {
+        actor: actor.clone().into_record(),
+        critic_q1: critic_q1.clone().into_record(),
+        critic_q2: critic_q2.clone().into_record(),
+        target_q1: target_q1.clone().into_record(),
+        target_q2: target_q2.clone().into_record(),
+        value_v: value_v.clone().into_record(),
+    };
+
+    (actor, new_state)
 }
 
-pub fn get_policy(batch: &[StateAction], _current_policy: &Policy) -> Policy {
+pub fn get_policy(batch: &[StateAction], current_policy: &Policy) -> Policy {
     let device = <B as BackendTypes>::Device::default();
     let num_transitions = batch.len() - 1;
 
@@ -288,32 +317,36 @@ pub fn get_policy(batch: &[StateAction], _current_policy: &Policy) -> Policy {
         "Dataset must contain at least 2 steps to construct transitions."
     );
 
-    // 1. Prepare Dataset
     let (t_states, t_actions, t_rewards, t_next_states) =
         prepare_iql_dataset(batch, num_transitions, &device);
 
-    // 2. Train and Retrieve Actor Network (Using Autodiff Backend)
-    let actor = train_iql_actor(
+    // --- EXTRACT PREVIOUS STATE ---
+    // Downcast to the Mutex and take ownership of its contents without cloning.
+    let previous_state: Option<IqlModelState> = current_policy
+        .network_state
+        .as_ref()
+        .and_then(|state_any| state_any.downcast_ref::<Mutex<Option<IqlModelState>>>())
+        .and_then(|mutex| mutex.lock().unwrap().take());
+
+    // --- TRAIN ---
+    let (actor, new_state) = train_iql_actor(
         t_states,
         t_actions,
         t_rewards,
         t_next_states,
         num_transitions,
         &device,
+        previous_state,
     );
 
     println!(">>> Converting Actor to pure Inference backend...");
 
-    // 3. Convert Autodiff model directly to pure inference model.
-    // The .valid() method automatically maps the weights over and
-    // permanently strips the gradient tape functionality.
     let infer_actor = actor.valid();
 
-    // 4. Dynamically target whatever the pure CPU equivalent of your backend is
     type InferBackend = <B as AutodiffBackend>::InnerBackend;
     let infer_device = <InferBackend as BackendTypes>::Device::default();
 
-    // 5. Encapsulate and Return Inference Closure
+    // --- ENCAPSULATE AND INJECT NEW STATE ---
     Policy::new(
         move |state_vec: &SVector<f64, DIM_X>| -> f64 {
             let state_array = [
@@ -323,17 +356,15 @@ pub fn get_policy(batch: &[StateAction], _current_policy: &Policy) -> Policy {
                 state_vec[3] as f32,
             ];
 
-            // Use the InferBackend here so Burn knows to bypass all autograd math
             let state_tensor = Tensor::<InferBackend, 1>::from_data(state_array, &infer_device)
                 .reshape([1, DIM_X]);
 
             let action_tensor = infer_actor.forward(state_tensor);
-
-            // Bypass the Vec heap allocation and pull the primitive directly
             let action_f32 = action_tensor.into_scalar();
 
             action_f32 as f64
         },
-        None, // Signals that no explicit linear K matrix exists
+        None,
     )
+    .with_network_state(Arc::new(Mutex::new(Some(new_state)))) // Package securely
 }

@@ -26,6 +26,9 @@ const BACKLASH_JOINTS: bool = true;
 const MAX_FALLS: usize = 20;
 
 pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // ---> PREDEFINED CONSTANT FOR NOISE SCALING <---
+    const VARIANCE_NOISE_SCALING: f64 = 1.0;
+
     println!("Loading MuJoCo model 'balboa.xml'...");
 
     // mujoco-rs uses MjModel::from_xml for loading files
@@ -44,7 +47,7 @@ pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Er
 
     let noise = estimate_process_noise(&model, &mut data);
     println!("============================================================");
-    println!("       PROCESS NOISE DIAGNOSTIC REPORT");
+    println!("        PROCESS NOISE DIAGNOSTIC REPORT");
     println!("============================================================");
 
     // 1. Print the Mean Vector (The "Bias")
@@ -118,6 +121,11 @@ pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Er
     let enable_noise = true;
 
     while viewer.running() {
+        // --- NEW: Evaluate the policy to get variance sums for noise scaling ---
+        let snapshot = { current_policy.lock().unwrap().clone() };
+        let (_, var_sum) = evaluate_policy_sim(&model, &mut data, snapshot);
+        let noise_multiplier = var_sum * VARIANCE_NOISE_SCALING;
+
         let batch_to_process = collect_full_batch_sim(
             &model,
             &mut data,
@@ -128,6 +136,7 @@ pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Er
             current_policy.clone(), // Pass the Arc directly
             visualize,
             enable_noise,
+            noise_multiplier, // <-- Pass the dynamic noise multiplier
         );
 
         // Break out of the loop if the user clicked the 'X' during batch collection
@@ -158,6 +167,10 @@ pub fn run_online_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Er
 }
 
 pub fn run_data_collection_mode_sim(visualize: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // ---> PREDEFINED CONSTANT FOR NOISE SCALING <---
+    const MAX_EXPLORATION_NOISE: f64 = 1.0; // The noise level when the robot is perfectly stable
+    const NOISE_ATTENUATION: f64 = 5.0; // How fast noise shrinks as the robot gets wobbly
+
     println!("Loading MuJoCo model 'balboa.xml'...");
     let model = if BACKLASH_JOINTS {
         MjModel::from_xml("balboa_delay.xml").expect("Failed to load balboa.xml")
@@ -198,6 +211,14 @@ pub fn run_data_collection_mode_sim(visualize: bool) -> Result<(), Box<dyn std::
     );
 
     while viewer.running() {
+        // --- NEW: Evaluate the policy to get variance sums for noise scaling ---
+        let snapshot = { current_policy.lock().unwrap().clone() };
+        let (_, var_sum) = evaluate_policy_sim(&model, &mut data, snapshot);
+        let noise_multiplier = MAX_EXPLORATION_NOISE / (1.0 + NOISE_ATTENUATION * var_sum);
+        println!(
+            "the exploration variance resulted in a noise multiplier of {}",
+            noise_multiplier
+        );
         let batch_to_process = collect_full_batch_sim(
             &model,
             &mut data,
@@ -208,6 +229,7 @@ pub fn run_data_collection_mode_sim(visualize: bool) -> Result<(), Box<dyn std::
             current_policy.clone(), // Pass the constant policy
             visualize,
             true,
+            noise_multiplier, // <-- Pass the dynamic noise multiplier
         );
 
         if batch_to_process.is_empty() {
@@ -237,6 +259,7 @@ pub fn run_data_collection_mode_sim(visualize: bool) -> Result<(), Box<dyn std::
     }
     Ok(())
 }
+
 pub fn run_sim_plot(
     visualize: bool,
     evaluation_threshold: f64,
@@ -244,6 +267,10 @@ pub fn run_sim_plot(
     n_updates: usize,
     uniform_half_interval: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // ---> PREDEFINED CONSTANT FOR NOISE SCALING <---
+    const MAX_EXPLORATION_NOISE: f64 = 100.0; // The noise level when the robot is perfectly stable
+    const NOISE_ATTENUATION: f64 = 1.0; // How fast noise shrinks as the robot gets wobbly
+
     println!("Loading MuJoCo model 'balboa.xml'...");
     let model = if BACKLASH_JOINTS {
         MjModel::from_xml("balboa_delay.xml").expect("Failed to load balboa.xml")
@@ -323,7 +350,7 @@ pub fn run_sim_plot(
 
     // --- 1. Evaluate the Original Baseline Policy ---
     println!("Evaluating original baseline policy...");
-    let baseline_cost = evaluate_policy_sim(&model, &mut data, baseline_policy.clone(), false);
+    let (baseline_cost, _) = evaluate_policy_sim(&model, &mut data, baseline_policy.clone());
     println!("Baseline Cost: {:.4}", baseline_cost);
 
     // --- 2. Generate N Policies via Uniform Perturbation ---
@@ -362,9 +389,12 @@ pub fn run_sim_plot(
 
         for (p_idx, policy) in active_policies {
             // A) EVALUATION PHASE (Noise OFF)
-            let empirical_cost = evaluate_policy_sim(&model, &mut data, policy.clone(), false);
+            let (empirical_cost, var_sum) = evaluate_policy_sim(&model, &mut data, policy.clone());
             cost_history[p_idx].push(empirical_cost);
-            println!("  Policy {} - Eval Cost: {:.4}", p_idx, empirical_cost);
+            println!(
+                "  Policy {} - Eval Cost: {:.4}, Var Sum: {:.4}",
+                p_idx, empirical_cost, var_sum
+            );
 
             if empirical_cost > evaluation_threshold {
                 println!(
@@ -373,6 +403,13 @@ pub fn run_sim_plot(
                 );
                 continue;
             }
+
+            // --- Calculate Dynamic Noise Multiplier ---
+            let noise_multiplier = MAX_EXPLORATION_NOISE / (1.0 + NOISE_ATTENUATION * var_sum);
+            println!(
+                "the exploration variance resulted in a noise multiplier of {}",
+                noise_multiplier
+            );
 
             // B) BATCH COLLECTION PHASE (Noise ON)
             // Arc abstraction handles the concurrent locks natively now
@@ -389,6 +426,7 @@ pub fn run_sim_plot(
                 current_policy,
                 visualize,
                 true,
+                noise_multiplier, // <-- Pass the dynamic noise multiplier
             );
 
             if batch_to_process.is_empty() {
@@ -415,13 +453,13 @@ pub fn run_sim_plot(
 
     // --- 4. Final Evaluation ---
     for (p_idx, policy) in active_policies.iter() {
-        let final_cost = evaluate_policy_sim(&model, &mut data, policy.clone(), false);
+        let (final_cost, _) = evaluate_policy_sim(&model, &mut data, policy.clone());
         cost_history[*p_idx].push(final_cost);
     }
 
     // --- 4.5 Print Surviving Policies Table ---
     println!("\n===================================================================================================================");
-    println!("                                   FINAL SURVIVING POLICIES REPORT                                                 ");
+    println!("                                     FINAL SURVIVING POLICIES REPORT                                               ");
     println!("===================================================================================================================");
 
     if BACKLASH_ESTIMATION {
@@ -433,7 +471,7 @@ pub fn run_sim_plot(
     }
 
     if active_policies.is_empty() {
-        println!("|                            No policies survived the evaluation threshold.                                       |");
+        println!("|                            No policies survived the evaluation threshold.                                        |");
     } else {
         for (p_idx, policy) in active_policies.iter() {
             let final_cost = cost_history[*p_idx].last().unwrap_or(&f64::NAN);
@@ -518,35 +556,41 @@ pub enum SimTask<'v, 't> {
         log_label: &'t str,
         batch_index: usize,
         was_balancing: &'t mut bool,
-        current_policy: Arc<Mutex<Policy>>, // <-- Replaced pending/active gains
+        current_policy: Arc<Mutex<Policy>>,
         enable_rendering: bool,
     },
     EvaluatePolicy {
-        policy: Policy, // <-- Holds the clonable Policy struct directly
+        policy: Policy,
     },
     EstimateProcessNoise,
 }
 
 pub enum SimResult {
     Batch(Vec<StateAction>),
-    EvaluationCost(f64),
+    // Holds (Total Cost, Sum of Variances)
+    EvaluationCost(f64, f64),
     NoiseData(SVector<f64, DIM_X>, SMatrix<f64, DIM_X, DIM_X>),
 }
 
 /// Bundles the tracking state so we don't pass 10 mutable arguments
 #[derive(Default)]
-struct SimTracker {
-    state_batch: Vec<StateAction>,
-    noises: Vec<SVector<f64, DIM_X>>,
-    total_cost: f64,
-    loop_counter: usize,
-    stability_counter: usize,
-    fall_count: usize,
-    last_noise: f64,
+pub struct SimTracker {
+    pub state_batch: Vec<StateAction>,
+    pub noises: Vec<SVector<f64, DIM_X>>,
+    pub total_cost: f64,
+    pub loop_counter: usize,
+    pub stability_counter: usize,
+    pub fall_count: usize,
+    pub last_noise: f64,
+
+    // --- NEW: Tracking fields for variance calculation ---
+    pub eval_state_sums: [f64; 4],
+    pub eval_state_sq_sums: [f64; 4],
+    pub eval_step_count: usize,
 }
 
 /// Instructions for the main loop after evaluating a step
-enum StepAction {
+pub enum StepAction {
     Continue,
     Break,
     AbortBatch,
@@ -557,6 +601,7 @@ pub fn unified_sim_loop<'a, 'v, 't>(
     data: &mut MjData<&'a MjModel>,
     mut task: SimTask<'v, 't>,
     enable_noise: bool,
+    noise_multiplier: f64, // <-- NEW: Multiplier for the OU noise variance
 ) -> SimResult {
     let control_step = 0.01;
     let sim_steps = (control_step / model.opt().timestep).round() as usize;
@@ -569,12 +614,11 @@ pub fn unified_sim_loop<'a, 'v, 't>(
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
 
     // 1. Setup initial conditions & matrices
-    // Now returns an analytical Policy instead of a K array
     let (analytical_policy, a_mat, b_mat) = setup_simulation(data, &task, &mut rng);
 
     println!(">>> [SIM] Running MuJoCo Simulation Loop...");
 
-    // --- NEW: Initialize tracking variables for the Hysteresis Estimator ---
+    // --- Initialize tracking variables for the Hysteresis Estimator ---
     let (init_phi_left, init_phi_right, init_theta, _, _, _) = extract_state(data, BACKLASH_JOINTS);
     let mut last_phi = (init_phi_left + init_phi_right) / 2.0;
     let mut last_theta = init_theta;
@@ -596,7 +640,6 @@ pub fn unified_sim_loop<'a, 'v, 't>(
         let phi = (phi_left + phi_right) / 2.0;
         let phi_dot = (phi_dot_left + phi_dot_right) / 2.0;
 
-        // --- NEW: Estimate Backlash via Play Operator ---
         if (phi - last_phi).abs() > JUMP_THRESHOLD || (theta - last_theta).abs() > JUMP_THRESHOLD {
             current_backlash = 0.0;
         } else {
@@ -628,6 +671,7 @@ pub fn unified_sim_loop<'a, 'v, 't>(
             phi_dot_left,
             phi_dot_right,
             enable_noise,
+            noise_multiplier, // <-- Pass the multiplier downstream
             &mut rng,
             &mut tracker.last_noise,
         );
@@ -661,10 +705,9 @@ pub fn unified_sim_loop<'a, 'v, 't>(
 
     // 3. Finalize and Return
     finalize_results(task, tracker, max_steps)
-}
-// ==========================================
-// HELPER FUNCTIONS
-// ==========================================
+} // ==========================================
+  // HELPER FUNCTIONS
+  // ==========================================
 
 fn calculate_discrete_lqr(
     a_mat: &SMatrix<f64, 4, 4>,
@@ -850,7 +893,8 @@ fn apply_motor_physics<'a>(
     phi_dot_left: f64,
     phi_dot_right: f64,
     enable_noise: bool,
-    rng: &mut StdRng,
+    noise_multiplier: f64, // <-- NEW
+    rng: &mut rand::rngs::StdRng,
     last_noise: &mut f64,
 ) -> (f64, f64) {
     let max_physical_torque = 0.22;
@@ -865,10 +909,15 @@ fn apply_motor_physics<'a>(
         let u2: f64 = rng.random_range(0.0..1.0);
         let epsilon = (-2.0f64 * u1.ln()).sqrt() * (2.0f64 * PI * u2).cos();
         let dt: f64 = 0.01;
-        let dx = THETA_OU * (-*last_noise) * dt + SIGMA_OU * epsilon * dt.sqrt();
+
+        // Multiplier scales the variance. This means we scale the standard deviation by sqrt.
+        let effective_sigma = SIGMA_OU * noise_multiplier.sqrt();
+
+        let dx = THETA_OU * (-*last_noise) * dt + effective_sigma * epsilon * dt.sqrt();
 
         // Standard deviation of the exact discrete series
-        let discrete_variance = (SIGMA_OU * SIGMA_OU) / (2.0 * THETA_OU - THETA_OU * THETA_OU * dt);
+        let discrete_variance =
+            (effective_sigma * effective_sigma) / (2.0 * THETA_OU - THETA_OU * THETA_OU * dt);
         let exact_std_dev = discrete_variance.sqrt();
 
         // The resulting Gaussian noise
@@ -923,9 +972,6 @@ fn process_step_result<'a>(
     // Extract base state
     let (phi, theta, phi_dot, theta_dot) = (x_k[0], x_k[1], x_k[2], x_k[3]);
 
-    // Safely extract backlash if it exists in the state vector
-    let _backlash = if BACKLASH_ESTIMATION { x_k[4] } else { 0.0 };
-
     let is_sane = theta.is_finite() && theta_dot.abs() < 100.0;
     let is_upright = theta.abs() < stop_angle_rad;
 
@@ -947,14 +993,13 @@ fn process_step_result<'a>(
                 let target_duration = Duration::from_secs_f64(control_step);
                 let elapsed = step_start.elapsed();
                 if elapsed < target_duration {
-                    thread::sleep(target_duration - elapsed);
+                    std::thread::sleep(target_duration - elapsed);
                 }
             }
 
             if is_sane && is_upright {
                 tracker.stability_counter += 1;
                 if tracker.stability_counter >= 10 {
-                    // stability_threshold
                     if !**was_balancing {
                         **was_balancing = true;
                     }
@@ -1004,6 +1049,19 @@ fn process_step_result<'a>(
                 + Q_COST[2] * phi_dot.powi(2)
                 + Q_COST[3] * theta_dot.powi(2);
             tracker.total_cost += state_cost + R_COST[0] * raw_tau.powi(2);
+
+            // --- NEW: Accumulate states for evaluating Variance ---
+            tracker.eval_state_sums[0] += phi;
+            tracker.eval_state_sums[1] += theta;
+            tracker.eval_state_sums[2] += phi_dot;
+            tracker.eval_state_sums[3] += theta_dot;
+
+            tracker.eval_state_sq_sums[0] += phi.powi(2);
+            tracker.eval_state_sq_sums[1] += theta.powi(2);
+            tracker.eval_state_sq_sums[2] += phi_dot.powi(2);
+            tracker.eval_state_sq_sums[3] += theta_dot.powi(2);
+
+            tracker.eval_step_count += 1;
         }
         SimTask::EstimateProcessNoise => {
             let (pl, pr, t, pdl, pdr, td) = extract_state(data, BACKLASH_JOINTS);
@@ -1015,7 +1073,7 @@ fn process_step_result<'a>(
             x_k1[3] = td;
 
             if BACKLASH_ESTIMATION {
-                x_k1[4] = x_k1[0] - x_k1[1]; //Fix not precise backlash = phi - theta
+                x_k1[4] = x_k1[0] - x_k1[1];
             }
 
             let x_dot_empirical = (x_k1 - x_k) / control_step;
@@ -1032,7 +1090,39 @@ fn finalize_results(task: SimTask, tracker: SimTracker, max_steps: usize) -> Sim
     match task {
         SimTask::CollectBatch { .. } => SimResult::Batch(tracker.state_batch),
         SimTask::EvaluatePolicy { .. } => {
-            SimResult::EvaluationCost(tracker.total_cost / max_steps as f64)
+            // --- CONSTANT COEFFICIENTS FOR WEIGHTED VARIANCE SUM ---
+            // Adjust these to penalize the variance of specific states more or less
+            // Order: [phi, theta, phi_dot, theta_dot]
+            const STATE_VAR_WEIGHTS: [f64; 4] = [10.0, 100.0, 0.1, 1.0];
+
+            let n = tracker.eval_step_count as f64;
+            let mut variances = [0.0; 4];
+            let mut weighted_variance_sum = 0.0;
+
+            if n > 1.0 {
+                // Compute independent variances
+                for i in 0..4 {
+                    let mean = tracker.eval_state_sums[i] / n;
+                    let variance = (tracker.eval_state_sq_sums[i] - n * mean * mean) / (n - 1.0);
+                    // Ensure precision floating points don't result in negative limits
+                    variances[i] = variance.max(0.0);
+                }
+
+                // Compute the weighted sum
+                for i in 0..4 {
+                    weighted_variance_sum += variances[i] * STATE_VAR_WEIGHTS[i];
+                }
+            }
+
+            // Print the independent variances and their weighted sum
+            println!("    [EVAL] State Variances:");
+            println!("      Var(φ)       : {:.6}", variances[0]);
+            println!("      Var(θ)       : {:.6}", variances[1]);
+            println!("      Var(φ_dot)   : {:.6}", variances[2]);
+            println!("      Var(θ_dot)   : {:.6}", variances[3]);
+            println!("      Weighted Sum : {:.6}", weighted_variance_sum);
+
+            SimResult::EvaluationCost(tracker.total_cost / max_steps as f64, weighted_variance_sum)
         }
         SimTask::EstimateProcessNoise => {
             let mut mean = SVector::<f64, DIM_X>::zeros();
@@ -1052,7 +1142,6 @@ fn finalize_results(task: SimTask, tracker: SimTracker, max_steps: usize) -> Sim
         }
     }
 }
-
 pub fn collect_full_batch_sim<'a, 'v, 't>(
     model: &'a MjModel,
     data: &mut MjData<&'a MjModel>,
@@ -1060,9 +1149,10 @@ pub fn collect_full_batch_sim<'a, 'v, 't>(
     log_label: &'t str,
     batch_index: usize,
     was_balancing: &'t mut bool,
-    current_policy: Arc<Mutex<Policy>>, // <-- Now expects the Arc directly
+    current_policy: Arc<Mutex<Policy>>,
     enable_rendering: bool,
     enable_noise: bool,
+    noise_multiplier: f64, // <-- NEW
 ) -> Vec<StateAction> {
     let task = SimTask::CollectBatch {
         viewer: Some(viewer),
@@ -1073,7 +1163,7 @@ pub fn collect_full_batch_sim<'a, 'v, 't>(
         enable_rendering,
     };
 
-    match unified_sim_loop(model, data, task, enable_noise) {
+    match unified_sim_loop(model, data, task, enable_noise, noise_multiplier) {
         SimResult::Batch(batch) => batch,
         _ => unreachable!("Expected SimResult::Batch from CollectBatch task"),
     }
@@ -1084,11 +1174,10 @@ pub fn estimate_process_noise<'a>(
     data: &mut MjData<&'a MjModel>,
 ) -> (SVector<f64, DIM_X>, SMatrix<f64, DIM_X, DIM_X>) {
     let task = SimTask::EstimateProcessNoise;
-
-    // The original estimate_process_noise did not use the OU exploration noise
     let enable_noise = false;
 
-    match unified_sim_loop(model, data, task, enable_noise) {
+    // Default noise multiplier 1.0 since noise is disabled here anyway
+    match unified_sim_loop(model, data, task, enable_noise, 1.0) {
         SimResult::NoiseData(mean, covariance) => (mean, covariance),
         _ => unreachable!("Expected SimResult::NoiseData from EstimateProcessNoise task"),
     }
@@ -1097,13 +1186,16 @@ pub fn estimate_process_noise<'a>(
 pub fn evaluate_policy_sim<'a>(
     model: &'a MjModel,
     data: &mut MjData<&'a MjModel>,
-    policy: Policy, // <-- Takes the generic Policy struct
-    enable_noise: bool,
-) -> f64 {
+    policy: Policy,
+) -> (f64, f64) {
     let task = SimTask::EvaluatePolicy { policy };
 
-    match unified_sim_loop(model, data, task, enable_noise) {
-        SimResult::EvaluationCost(cost) => cost,
+    // Hardcode noise to off during policy evaluation
+    let enable_noise = false;
+    let dummy_noise_multiplier = 1.0;
+
+    match unified_sim_loop(model, data, task, enable_noise, dummy_noise_multiplier) {
+        SimResult::EvaluationCost(cost, var_sum) => (cost, var_sum),
         _ => unreachable!("Expected SimResult::EvaluationCost from EvaluatePolicy task"),
     }
 }
