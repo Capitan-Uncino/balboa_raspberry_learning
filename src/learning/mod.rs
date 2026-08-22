@@ -1,4 +1,5 @@
 pub mod backlash_estimating_lstdq;
+pub mod disag_implicit_q_learning;
 pub mod implicit_q_learning;
 pub mod lstdq;
 pub mod lstdq_2019;
