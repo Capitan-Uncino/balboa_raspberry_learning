@@ -1,8 +1,8 @@
 use crate::learning::policy::Policy;
 use nalgebra::{DMatrix, SMatrix, SVector};
 
-//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
-pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
+pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
+//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
 pub const DT: f64 = 0.01;
 
 pub const Q_COST: [f64; 4] = [10.0, 100.0, 0.0, 0.1];
@@ -189,7 +189,7 @@ pub fn get_policy(batch: &[StateAction], current_policy: &Policy) -> Policy {
             let k_greedy = compute_lqr_gain(&a_mat, &b_mat);
 
             // Apply Polyak Averaging (Policy-Space Trust Region)
-            let alpha = 1.0;
+            let alpha = 0.1;
             let k_trust = current_k * (1.0 - alpha) + k_greedy * alpha;
 
             println!(">>> Trust Region Applied: alpha = {}", alpha);

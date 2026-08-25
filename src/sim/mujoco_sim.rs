@@ -1,9 +1,9 @@
 use crate::file_utils::get_next_file_index;
 use crate::graphic_utils::plot_cost_evolution;
-use crate::learning::implicit_q_learning::{
+use crate::learning::policy::Policy;
+use crate::learning::single_batch_lspi::{
     get_policy, StateAction, ANALYTIC_LQR_POLICY, DIM_U, DIM_X, Q_COST, R_COST, SAMPLES_PER_ITER,
 };
-use crate::learning::policy::Policy;
 use crate::logging_utils::log_progress;
 use mujoco_rs::prelude::*;
 use mujoco_rs::viewer::MjViewer;
@@ -405,7 +405,8 @@ pub fn run_sim_plot(
             }
 
             // --- Calculate Dynamic Noise Multiplier ---
-            let noise_multiplier = MAX_EXPLORATION_NOISE / (1.0 + NOISE_ATTENUATION * var_sum);
+            let noise_multiplier = 1.0;
+            MAX_EXPLORATION_NOISE / (1.0 + NOISE_ATTENUATION * var_sum);
             println!(
                 "the exploration variance resulted in a noise multiplier of {}",
                 noise_multiplier

@@ -1,7 +1,7 @@
 use crate::learning::policy::Policy;
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
-//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
-pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
+pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
+//pub const ANALYTIC_LQR_POLICY: [f64; 4] = [0.5196, 8.3716, 0.3161, 0.5893];
 
 //pub const ANALYTIC_LQR_POLICY: [f64; 4] = [
 //    0.3753457176107561,

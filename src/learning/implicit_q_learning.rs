@@ -12,6 +12,8 @@ use nalgebra::SVector;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
+use burn::optim::SgdConfig;
+
 pub const ANALYTIC_LQR_POLICY: [f64; 4] = [1.3665, 15.4366, 0.4062, 1.3743];
 pub const SAMPLES_PER_ITER: usize = 50000;
 pub const IQL_TAU: f32 = 0.8; // Expectile threshold
@@ -190,12 +192,12 @@ fn train_iql_actor(
     previous_state: Option<IqlModelState>,
 ) -> (MlpNetwork<B>, IqlModelState) {
     // STOCHASTIC ACTOR: Output dimension is now DIM_U * 2 (Mean and Log_Std)
-    let mut actor = MlpNetwork::<B>::new(DIM_X, 32, DIM_U * 2, device);
-    let mut critic_q1 = MlpNetwork::<B>::new(DIM_X + DIM_U, 32, 1, device);
-    let mut critic_q2 = MlpNetwork::<B>::new(DIM_X + DIM_U, 32, 1, device);
-    let mut value_v = MlpNetwork::<B>::new(DIM_X, 32, 1, device);
-    let mut target_q1 = MlpNetwork::<B>::new(DIM_X + DIM_U, 32, 1, device);
-    let mut target_q2 = MlpNetwork::<B>::new(DIM_X + DIM_U, 32, 1, device);
+    let mut actor = MlpNetwork::<B>::new(DIM_X, 16, DIM_U * 2, device);
+    let mut critic_q1 = MlpNetwork::<B>::new(DIM_X + DIM_U, 16, 1, device);
+    let mut critic_q2 = MlpNetwork::<B>::new(DIM_X + DIM_U, 16, 1, device);
+    let mut value_v = MlpNetwork::<B>::new(DIM_X, 16, 1, device);
+    let mut target_q1 = MlpNetwork::<B>::new(DIM_X + DIM_U, 16, 1, device);
+    let mut target_q2 = MlpNetwork::<B>::new(DIM_X + DIM_U, 16, 1, device);
 
     if let Some(state) = previous_state {
         println!(">>> Restoring previous IQL networks to resume training...");
@@ -210,10 +212,15 @@ fn train_iql_actor(
         target_q2 = critic_q2.clone();
     }
 
-    let mut optim_actor = AdamConfig::new().init::<B, MlpNetwork<B>>();
-    let mut optim_q1 = AdamConfig::new().init::<B, MlpNetwork<B>>();
-    let mut optim_q2 = AdamConfig::new().init::<B, MlpNetwork<B>>();
-    let mut optim_v = AdamConfig::new().init::<B, MlpNetwork<B>>();
+    //let mut optim_actor = AdamConfig::new().init::<B, MlpNetwork<B>>();
+    //let mut optim_q1 = AdamConfig::new().init::<B, MlpNetwork<B>>();
+    //let mut optim_q2 = AdamConfig::new().init::<B, MlpNetwork<B>>();
+    //let mut optim_v = AdamConfig::new().init::<B, MlpNetwork<B>>();
+
+    let mut optim_actor = SgdConfig::new().init::<B, MlpNetwork<B>>();
+    let mut optim_q1 = SgdConfig::new().init::<B, MlpNetwork<B>>();
+    let mut optim_q2 = SgdConfig::new().init::<B, MlpNetwork<B>>();
+    let mut optim_v = SgdConfig::new().init::<B, MlpNetwork<B>>();
 
     println!(">>> Starting Original Paper IQL Optimization Loop...");
     let epochs = 60;
@@ -416,7 +423,7 @@ pub fn get_policy(batch: &[StateAction], current_policy: &Policy) -> Policy {
 
             // 3. Calculate Raw Blend Factor
             let safe_std = 0.05;
-            let unsafe_std = 0.2;
+            let unsafe_std = 0.5;
 
             let mut raw_alpha = (unsafe_std - std) / (unsafe_std - safe_std);
             raw_alpha = raw_alpha.clamp(0.0, 1.0);

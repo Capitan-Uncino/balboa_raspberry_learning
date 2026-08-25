@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             #[cfg(feature = "sim")]
             {
                 if args.plot {
-                    run_sim_plot(args.visualize, 50.0, 1, 3, 0.5)?;
+                    run_sim_plot(args.visualize, 50.0, 1, 10, 0.5)?;
                 } else {
                     run_online_mode_sim(args.visualize)?;
                 }
